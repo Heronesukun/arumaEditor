@@ -32,6 +32,7 @@ test("server-renders the Aruma writing workspace", async () => {
   assert.match(html, /<title>Aruma Editor · 把想法写成文章<\/title>/i);
   assert.match(html, /Aruma/);
   assert.match(html, /写下今天的故事/);
+  assert.match(html, /新草稿/);
   assert.match(html, /发布到 Aruma/);
   assert.match(html, /Frontmatter/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);

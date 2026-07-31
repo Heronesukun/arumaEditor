@@ -128,7 +128,26 @@ function createDraft(): Draft {
   };
 }
 
-const starterDraft = createDraft();
+// The server can keep this module alive for minutes, while the browser evaluates
+// it at navigation time. Keep the hydration draft fully deterministic and only
+// create a dated draft after the client has mounted.
+const starterDraft: Draft = {
+  id: "starter-draft",
+  title: "写下今天的故事",
+  slug: "new-article",
+  published: "",
+  description: "给这篇文章写一句轻轻的摘要吧。",
+  tags: ["随笔"],
+  author: "拾音",
+  category: "日常",
+  pinned: false,
+  draft: true,
+  heroImage: "",
+  content: `## 从这里开始\n\n今天想记录的是……\n\n> 不必一次写完，想法会在停留中慢慢长出形状。\n\n### 一个小标题\n\n- 此刻想到的事\n- 想留给未来的话\n`,
+  createdAt: 0,
+  updatedAt: 0,
+  source: "draft",
+};
 
 function cleanDate(value: unknown) {
   if (value instanceof Date) return value.toISOString().slice(0, 10);
@@ -200,6 +219,7 @@ function serializeDraft(article: Draft) {
 }
 
 function relativeTime(timestamp: number) {
+  if (timestamp === 0) return "新草稿";
   const diff = Date.now() - timestamp;
   if (diff < 60_000) return "刚刚";
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
@@ -258,9 +278,11 @@ export default function Home() {
       const stored = localStorage.getItem(STORAGE_KEY);
       const storedActive = localStorage.getItem(ACTIVE_KEY);
       const storedTheme = localStorage.getItem(THEME_KEY);
+      let restoredDrafts = false;
       if (stored) {
         const parsed = JSON.parse(stored) as Draft[];
         if (Array.isArray(parsed) && parsed.length) {
+          restoredDrafts = true;
           // Restoring browser-owned state is the purpose of this mount effect.
           // eslint-disable-next-line react-hooks/set-state-in-effect
           setDrafts(parsed);
@@ -270,6 +292,11 @@ export default function Home() {
               : parsed[0].id,
           );
         }
+      }
+      if (!restoredDrafts) {
+        const firstDraft = createDraft();
+        setDrafts([firstDraft]);
+        setActiveId(firstDraft.id);
       }
       setIsDark(storedTheme === "dark");
     } catch {
