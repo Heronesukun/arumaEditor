@@ -40,6 +40,9 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/desktop-dist/
+/release/
+/arumaEditor.zip
 
 # local preview logs
 /.sites-dev.stdout.log

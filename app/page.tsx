@@ -11,8 +11,10 @@ import {
   Eye,
   FileDown,
   FileText,
+  FolderOpen,
   FolderHeart,
   Hash,
+  HardDrive,
   Heading2,
   Image as ImageIcon,
   Italic,
@@ -26,6 +28,7 @@ import {
   PenLine,
   Plus,
   Quote,
+  RefreshCw,
   Search,
   Settings2,
   Sparkles,
@@ -37,7 +40,6 @@ import {
 } from "lucide-react";
 import { dump, load } from "js-yaml";
 import { marked } from "marked";
-import Image from "next/image";
 import {
   ChangeEvent,
   KeyboardEvent,
@@ -50,6 +52,48 @@ import {
 
 type ViewMode = "write" | "split" | "preview";
 type ArticleSource = "draft" | "imported" | "published";
+
+function escapeHtml(value: string) {
+  return value.replace(
+    /[&<>"']/g,
+    (character) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[character] ?? character,
+  );
+}
+
+function safeMarkdownUrl(value: string) {
+  const url = value.trim();
+  if (/^(https?:|mailto:)/i.test(url)) return url;
+  if (/^(#|\/|\.\/|\.\.\/)/.test(url)) return url;
+  return "";
+}
+
+const previewRenderer = new marked.Renderer();
+
+previewRenderer.html = ({ text }) => escapeHtml(text);
+previewRenderer.link = function ({ href, title, tokens }) {
+  const label = this.parser.parseInline(tokens);
+  const safeHref = safeMarkdownUrl(href);
+  if (!safeHref) return label;
+  const titleAttribute = title
+    ? ` title="${escapeHtml(title)}"`
+    : "";
+  return `<a href="${escapeHtml(safeHref)}"${titleAttribute} rel="noreferrer noopener">${label}</a>`;
+};
+previewRenderer.image = ({ href, title, text }) => {
+  const safeHref = safeMarkdownUrl(href);
+  if (!safeHref) return escapeHtml(text);
+  const titleAttribute = title
+    ? ` title="${escapeHtml(title)}"`
+    : "";
+  return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text)}"${titleAttribute}>`;
+};
 
 type Draft = {
   id: string;
@@ -67,6 +111,57 @@ type Draft = {
   createdAt: number;
   updatedAt: number;
   source: ArticleSource;
+  blogId: string | null;
+};
+
+type BlogStatus = "connected" | "permission" | "missing";
+
+type BlogConnection = {
+  id: string;
+  name: string;
+  rootPath: string;
+  postPath: string;
+  status: BlogStatus;
+  message: string;
+  articleCount: number;
+  lastConnectedAt: number;
+  lastSyncedAt: number;
+};
+
+type BlogArticle = {
+  slug: string;
+  text: string;
+  lastModified: number;
+};
+
+type BlogScanResult = {
+  connection: BlogConnection;
+  articles: BlogArticle[];
+};
+
+type WorkspaceSnapshot = {
+  version: number;
+  drafts: Draft[];
+  activeId: string | null;
+  isDark: boolean;
+  blogs: BlogConnection[];
+  activeBlogId: string | null;
+};
+
+type DesktopBridge = {
+  platform: string;
+  loadWorkspace: () => Promise<WorkspaceSnapshot>;
+  saveWorkspace: (workspace: WorkspaceSnapshot) => Promise<{ ok: boolean }>;
+  addBlog: () => Promise<BlogScanResult | null>;
+  scanBlog: (connection: BlogConnection) => Promise<BlogScanResult>;
+  publishArticle: (request: {
+    connection: BlogConnection;
+    slug: string;
+    markdown: string;
+    overwrite: boolean;
+  }) => Promise<{ ok: boolean; exists: boolean; target: string }>;
+  revealBlog: (connection: BlogConnection) => Promise<string>;
+  getVersion: () => Promise<string>;
 };
 
 type DirectoryHandleLike = {
@@ -87,6 +182,7 @@ type DirectoryHandleLike = {
     }>;
   }>;
   requestPermission?: (options: { mode: "readwrite" }) => Promise<string>;
+  queryPermission?: (options: { mode: "readwrite" }) => Promise<string>;
   values?: () => AsyncIterable<DirectoryHandleLike>;
 };
 
@@ -96,18 +192,22 @@ declare global {
       id?: string;
       mode?: "read" | "readwrite";
     }) => Promise<DirectoryHandleLike>;
+    arumaDesktop?: DesktopBridge;
   }
 }
 
 const STORAGE_KEY = "aruma-editor:drafts:v1";
 const ACTIVE_KEY = "aruma-editor:active:v1";
 const THEME_KEY = "aruma-editor:theme:v1";
+const BLOGS_KEY = "aruma-editor:blogs:v1";
+const ACTIVE_BLOG_KEY = "aruma-editor:active-blog:v1";
+const HANDLE_DATABASE = "aruma-editor-handles";
 
 function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function createDraft(): Draft {
+function createDraft(blogId: string | null = null): Draft {
   const now = Date.now();
   return {
     id: `draft-${now}`,
@@ -125,6 +225,7 @@ function createDraft(): Draft {
     createdAt: now,
     updatedAt: now,
     source: "draft",
+    blogId,
   };
 }
 
@@ -147,6 +248,7 @@ const starterDraft: Draft = {
   createdAt: 0,
   updatedAt: 0,
   source: "draft",
+  blogId: null,
 };
 
 function cleanDate(value: unknown) {
@@ -155,7 +257,11 @@ function cleanDate(value: unknown) {
   return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : today();
 }
 
-function parseMarkdownDocument(text: string, fileName = "article.md"): Draft {
+function parseMarkdownDocument(
+  text: string,
+  fileName = "article.md",
+  blogId: string | null = null,
+): Draft {
   const now = Date.now();
   const frontmatter = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?/);
   let data: Record<string, unknown> = {};
@@ -192,7 +298,58 @@ function parseMarkdownDocument(text: string, fileName = "article.md"): Draft {
     createdAt: now,
     updatedAt: now,
     source: "imported",
+    blogId,
   };
+}
+
+function normalizeDraft(value: Draft): Draft {
+  return { ...value, blogId: value.blogId ?? null };
+}
+
+function openHandleDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(HANDLE_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("handles")) {
+        request.result.createObjectStore("handles");
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveDirectoryHandle(id: string, handle: DirectoryHandleLike) {
+  const database = await openHandleDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("handles", "readwrite");
+    transaction.objectStore("handles").put(handle, id);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function loadDirectoryHandle(id: string) {
+  const database = await openHandleDatabase();
+  const handle = await new Promise<DirectoryHandleLike | null>((resolve, reject) => {
+    const request = database.transaction("handles", "readonly").objectStore("handles").get(id);
+    request.onsuccess = () => resolve((request.result as DirectoryHandleLike) ?? null);
+    request.onerror = () => reject(request.error);
+  });
+  database.close();
+  return handle;
+}
+
+async function deleteDirectoryHandle(id: string) {
+  const database = await openHandleDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("handles", "readwrite");
+    transaction.objectStore("handles").delete(id);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
 }
 
 function serializeDraft(article: Draft) {
@@ -264,69 +421,156 @@ export default function Home() {
   const [saveState, setSaveState] = useState<"saved" | "saving">("saved");
   const [cursorLine, setCursorLine] = useState(1);
   const [toast, setToast] = useState("");
-  const [blogHandle, setBlogHandle] = useState<DirectoryHandleLike | null>(null);
-  const [blogName, setBlogName] = useState("");
+  const [blogs, setBlogs] = useState<BlogConnection[]>([]);
+  const [activeBlogId, setActiveBlogId] = useState<string | null>(null);
+  const [connectionManagerOpen, setConnectionManagerOpen] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [syncingBlogId, setSyncingBlogId] = useState<string | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const blogHandlesRef = useRef(new Map<string, DirectoryHandleLike>());
 
   const active = drafts.find((draft) => draft.id === activeId) ?? drafts[0];
+  const activeBlog = blogs.find((blog) => blog.id === activeBlogId) ?? null;
+  const draftBlog = blogs.find((blog) => blog.id === active?.blogId) ?? null;
+  const assetRoot =
+    typeof window !== "undefined" && window.arumaDesktop ? "." : "";
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      const storedActive = localStorage.getItem(ACTIVE_KEY);
-      const storedTheme = localStorage.getItem(THEME_KEY);
-      let restoredDrafts = false;
-      if (stored) {
-        const parsed = JSON.parse(stored) as Draft[];
-        if (Array.isArray(parsed) && parsed.length) {
-          restoredDrafts = true;
-          // Restoring browser-owned state is the purpose of this mount effect.
-          // eslint-disable-next-line react-hooks/set-state-in-effect
-          setDrafts(parsed);
-          setActiveId(
-            parsed.some((item) => item.id === storedActive)
-              ? (storedActive as string)
-              : parsed[0].id,
+    let cancelled = false;
+
+    async function hydrateWorkspace() {
+      try {
+        let restoredDrafts: Draft[] = [];
+        let restoredActiveId: string | null = null;
+        let restoredBlogs: BlogConnection[] = [];
+        let restoredActiveBlogId: string | null = null;
+        let restoredTheme = false;
+
+        if (window.arumaDesktop) {
+          const workspace = await window.arumaDesktop.loadWorkspace();
+          restoredDrafts = workspace.drafts.map(normalizeDraft);
+          restoredActiveId = workspace.activeId;
+          restoredBlogs = workspace.blogs;
+          restoredActiveBlogId = workspace.activeBlogId;
+          restoredTheme = workspace.isDark;
+        } else {
+          const storedDrafts = localStorage.getItem(STORAGE_KEY);
+          const storedBlogs = localStorage.getItem(BLOGS_KEY);
+          restoredDrafts = storedDrafts
+            ? (JSON.parse(storedDrafts) as Draft[]).map(normalizeDraft)
+            : [];
+          restoredActiveId = localStorage.getItem(ACTIVE_KEY);
+          restoredActiveBlogId = localStorage.getItem(ACTIVE_BLOG_KEY);
+          restoredTheme = localStorage.getItem(THEME_KEY) === "dark";
+
+          const blogMetadata = storedBlogs
+            ? (JSON.parse(storedBlogs) as BlogConnection[])
+            : [];
+          restoredBlogs = await Promise.all(
+            blogMetadata.map(async (blog) => {
+              try {
+                const handle = await loadDirectoryHandle(blog.id);
+                if (!handle) {
+                  return {
+                    ...blog,
+                    status: "permission" as const,
+                    message: "需要重新授权目录",
+                  };
+                }
+                blogHandlesRef.current.set(blog.id, handle);
+                const permission = handle.queryPermission
+                  ? await handle.queryPermission({ mode: "readwrite" })
+                  : "prompt";
+                return {
+                  ...blog,
+                  status: permission === "granted" ? "connected" : "permission",
+                  message:
+                    permission === "granted" ? "目录可读写" : "需要重新授权目录",
+                } as BlogConnection;
+              } catch {
+                return {
+                  ...blog,
+                  status: "permission" as const,
+                  message: "需要重新授权目录",
+                };
+              }
+            }),
           );
         }
-      }
-      if (!restoredDrafts) {
+
+        if (cancelled) return;
+        const firstBlogId =
+          restoredBlogs.find((blog) => blog.id === restoredActiveBlogId)?.id ??
+          restoredBlogs[0]?.id ??
+          null;
+        const nextDrafts = restoredDrafts.length
+          ? restoredDrafts
+          : [createDraft(firstBlogId)];
+        const nextActiveId = nextDrafts.some(
+          (draft) => draft.id === restoredActiveId,
+        )
+          ? restoredActiveId
+          : nextDrafts[0].id;
+
+        // Restore external device state after the asynchronous load completes.
+        setDrafts(nextDrafts);
+        setActiveId(nextActiveId as string);
+        setBlogs(restoredBlogs);
+        setActiveBlogId(firstBlogId);
+        setIsDark(restoredTheme);
+      } catch {
+        if (cancelled) return;
         const firstDraft = createDraft();
         setDrafts([firstDraft]);
         setActiveId(firstDraft.id);
+        setToast("工作区恢复失败，已创建安全的新草稿");
+      } finally {
+        if (!cancelled) setHydrated(true);
       }
-      setIsDark(storedTheme === "dark");
-    } catch {
-      // A corrupted local draft should never prevent the editor from opening.
-    } finally {
-      setHydrated(true);
     }
+
+    void hydrateWorkspace();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
-    // This status mirrors the delayed localStorage synchronization below.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    // This status mirrors the delayed workspace synchronization below.
     setSaveState("saving");
-    const timer = window.setTimeout(() => {
+    const timer = window.setTimeout(async () => {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(drafts));
-        localStorage.setItem(ACTIVE_KEY, activeId);
+        const workspace: WorkspaceSnapshot = {
+          version: 1,
+          drafts,
+          activeId,
+          isDark,
+          blogs,
+          activeBlogId,
+        };
+        if (window.arumaDesktop) {
+          await window.arumaDesktop.saveWorkspace(workspace);
+        } else {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(drafts));
+          localStorage.setItem(ACTIVE_KEY, activeId);
+          localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
+          localStorage.setItem(BLOGS_KEY, JSON.stringify(blogs));
+          if (activeBlogId) {
+            localStorage.setItem(ACTIVE_BLOG_KEY, activeBlogId);
+          } else {
+            localStorage.removeItem(ACTIVE_BLOG_KEY);
+          }
+        }
         setSaveState("saved");
       } catch {
-        setToast("本地空间不足，请先导出重要草稿");
+        setToast("工作区保存失败，请先导出重要草稿");
       }
     }, 550);
     return () => window.clearTimeout(timer);
-  }, [activeId, drafts, hydrated]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
-  }, [hydrated, isDark]);
+  }, [activeBlogId, activeId, blogs, drafts, hydrated, isDark]);
 
   useEffect(() => {
     if (!toast) return;
@@ -358,8 +602,11 @@ export default function Home() {
   }, [drafts, search]);
 
   const previewHtml = useMemo(() => {
-    marked.setOptions({ breaks: true, gfm: true });
-    return marked.parse(active?.content ?? "") as string;
+    return marked.parse(active?.content ?? "", {
+      breaks: true,
+      gfm: true,
+      renderer: previewRenderer,
+    }) as string;
   }, [active?.content]);
 
   const updateActive = useCallback(
@@ -379,7 +626,7 @@ export default function Home() {
   const showMessage = (message: string) => setToast(message);
 
   const addDraft = () => {
-    const next = createDraft();
+    const next = createDraft(activeBlogId);
     const duplicateCount = drafts.filter((item) =>
       item.slug.startsWith(next.slug),
     ).length;
@@ -402,7 +649,7 @@ export default function Home() {
         setActiveId(remaining[0].id);
         return remaining;
       }
-      const fresh = createDraft();
+      const fresh = createDraft(activeBlogId);
       setActiveId(fresh.id);
       return [fresh];
     });
@@ -451,7 +698,11 @@ export default function Home() {
   const importFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const parsed = parseMarkdownDocument(await file.text(), file.name);
+    const parsed = parseMarkdownDocument(
+      await file.text(),
+      file.name,
+      activeBlogId,
+    );
     setDrafts((current) => [parsed, ...current]);
     setActiveId(parsed.id);
     event.target.value = "";
@@ -479,57 +730,250 @@ export default function Home() {
     return content.getDirectoryHandle("post");
   };
 
-  const scanBlog = async (postDirectory: DirectoryHandleLike) => {
-    if (!postDirectory.values) return [];
-    const found: Draft[] = [];
+  const scanBrowserBlog = async (
+    postDirectory: DirectoryHandleLike,
+    connection: BlogConnection,
+  ): Promise<BlogScanResult> => {
+    if (!postDirectory.values) {
+      return { connection, articles: [] };
+    }
+    const articles: BlogArticle[] = [];
     for await (const entry of postDirectory.values()) {
       if (entry.kind !== "directory") continue;
       try {
         const articleFile = await entry.getFileHandle("index.md");
         const file = await articleFile.getFile();
-        const parsed = parseMarkdownDocument(await file.text(), `${entry.name}.md`);
-        parsed.id = `blog-${entry.name}`;
-        parsed.slug = entry.name;
-        parsed.source = "published";
-        parsed.createdAt = file.lastModified;
-        parsed.updatedAt = file.lastModified;
-        found.push(parsed);
+        articles.push({
+          slug: entry.name,
+          text: await file.text(),
+          lastModified: file.lastModified,
+        });
       } catch {
         // Ignore non-article folders.
       }
     }
-    return found.sort((a, b) => b.updatedAt - a.updatedAt);
+    articles.sort((a, b) => b.lastModified - a.lastModified);
+    return {
+      connection: {
+        ...connection,
+        status: "connected",
+        message: "目录可读写",
+        articleCount: articles.length,
+        lastSyncedAt: Date.now(),
+      },
+      articles,
+    };
   };
 
-  const connectBlog = async () => {
-    if (!window.showDirectoryPicker) {
-      showMessage("当前浏览器不支持目录连接，请使用 Chrome 或 Edge");
-      return null;
+  const mergeScannedArticles = (
+    connection: BlogConnection,
+    articles: BlogArticle[],
+  ) => {
+    const incoming = articles.map((article) => {
+      const parsed = parseMarkdownDocument(
+        article.text,
+        `${article.slug}.md`,
+        connection.id,
+      );
+      parsed.id = `blog-${connection.id}-${article.slug}`;
+      parsed.slug = article.slug;
+      parsed.source = "published";
+      parsed.createdAt = article.lastModified;
+      parsed.updatedAt = article.lastModified;
+      return parsed;
+    });
+
+    setDrafts((current) => {
+      const existing = new Map(
+        current
+          .filter(
+            (draft) =>
+              draft.source === "published" && draft.blogId === connection.id,
+          )
+          .map((draft) => [draft.slug, draft]),
+      );
+      const otherDrafts = current.filter(
+        (draft) =>
+          draft.source !== "published" || draft.blogId !== connection.id,
+      );
+      const synced = incoming.map((draft) => existing.get(draft.slug) ?? draft);
+      return [...otherDrafts, ...synced];
+    });
+  };
+
+  const registerScan = (result: BlogScanResult, replacedId?: string) => {
+    const connection = result.connection;
+    if (replacedId && replacedId !== connection.id) {
+      setDrafts((current) =>
+        current.map((draft) =>
+          draft.blogId === replacedId
+            ? { ...draft, blogId: connection.id }
+            : draft,
+        ),
+      );
     }
+    setBlogs((current) => {
+      const withoutReplaced = current.filter(
+        (blog) => blog.id !== connection.id && blog.id !== replacedId,
+      );
+      return [...withoutReplaced, connection];
+    });
+    setActiveBlogId(connection.id);
+    mergeScannedArticles(connection, result.articles);
+  };
+
+  const connectBlog = async (replacedId?: string) => {
     setIsConnecting(true);
     try {
-      const root = await window.showDirectoryPicker({
-        id: "aruma-blog",
-        mode: "readwrite",
-      });
-      const postDirectory = await resolvePostDirectory(root);
-      const published = await scanBlog(postDirectory);
-      setBlogHandle(postDirectory);
-      setBlogName(root.name);
-      setDrafts((current) => {
-        const publishedIds = new Set(published.map((item) => item.id));
-        const local = current.filter((item) => !publishedIds.has(item.id));
-        return [...local, ...published];
-      });
-      showMessage(`已连接 ${root.name}，读取到 ${published.length} 篇文章`);
-      return postDirectory;
+      let result: BlogScanResult | null = null;
+      if (window.arumaDesktop) {
+        result = await window.arumaDesktop.addBlog();
+      } else {
+        if (!window.showDirectoryPicker) {
+          showMessage("当前浏览器不支持目录连接，请使用 Chrome 或 Edge");
+          return null;
+        }
+        const root = await window.showDirectoryPicker({
+          id: "aruma-blog",
+          mode: "readwrite",
+        });
+        const postDirectory = await resolvePostDirectory(root);
+        const id = replacedId ?? `web-${Date.now().toString(36)}`;
+        const connection: BlogConnection = {
+          id,
+          name: root.name,
+          rootPath: root.name,
+          postPath: "src/content/post",
+          status: "connected",
+          message: "目录可读写",
+          articleCount: 0,
+          lastConnectedAt: Date.now(),
+          lastSyncedAt: Date.now(),
+        };
+        blogHandlesRef.current.set(id, postDirectory);
+        await saveDirectoryHandle(id, postDirectory);
+        result = await scanBrowserBlog(postDirectory, connection);
+      }
+
+      if (!result) return null;
+      registerScan(result, replacedId);
+      showMessage(
+        `已连接 ${result.connection.name}，读取到 ${result.articles.length} 篇文章`,
+      );
+      return result.connection;
     } catch (error) {
       if ((error as Error).name !== "AbortError") {
-        showMessage("没有找到 Aruma 的 src/content/post 目录");
+        showMessage((error as Error).message || "没有找到 Aruma 博客目录");
       }
       return null;
     } finally {
       setIsConnecting(false);
+    }
+  };
+
+  const syncBlog = async (connection: BlogConnection) => {
+    setSyncingBlogId(connection.id);
+    try {
+      let result: BlogScanResult;
+      if (window.arumaDesktop) {
+        result = await window.arumaDesktop.scanBlog(connection);
+      } else {
+        let handle = blogHandlesRef.current.get(connection.id);
+        if (!handle) {
+          handle = (await loadDirectoryHandle(connection.id)) ?? undefined;
+        }
+        if (!handle) {
+          await connectBlog(connection.id);
+          return;
+        }
+        const permission = handle.requestPermission
+          ? await handle.requestPermission({ mode: "readwrite" })
+          : "granted";
+        if (permission !== "granted") {
+          setBlogs((current) =>
+            current.map((blog) =>
+              blog.id === connection.id
+                ? {
+                    ...blog,
+                    status: "permission",
+                    message: "需要重新授权目录",
+                  }
+                : blog,
+            ),
+          );
+          return;
+        }
+        blogHandlesRef.current.set(connection.id, handle);
+        result = await scanBrowserBlog(handle, connection);
+      }
+      registerScan(result);
+      showMessage(
+        `${result.connection.name} 已同步，共 ${result.articles.length} 篇文章`,
+      );
+    } catch (error) {
+      setBlogs((current) =>
+        current.map((blog) =>
+          blog.id === connection.id
+            ? {
+                ...blog,
+                status: "missing",
+                message: (error as Error).message || "博客目录不可访问",
+              }
+            : blog,
+        ),
+      );
+      showMessage("同步失败，请检查博客目录");
+    } finally {
+      setSyncingBlogId(null);
+    }
+  };
+
+  const removeBlog = async (connection: BlogConnection) => {
+    if (
+      !window.confirm(
+        `移除“${connection.name}”连接？本地草稿会保留，博客文件不会被删除。`,
+      )
+    ) {
+      return;
+    }
+    if (!window.arumaDesktop) {
+      await deleteDirectoryHandle(connection.id).catch(() => {});
+      blogHandlesRef.current.delete(connection.id);
+    }
+    setBlogs((current) => current.filter((blog) => blog.id !== connection.id));
+    setDrafts((current) => {
+      const remaining = current
+        .filter(
+          (draft) =>
+            draft.source !== "published" || draft.blogId !== connection.id,
+        )
+        .map((draft) =>
+          draft.blogId === connection.id
+            ? { ...draft, blogId: null, source: "draft" as const }
+            : draft,
+        );
+      if (!remaining.length) {
+        const fresh = createDraft();
+        setActiveId(fresh.id);
+        return [fresh];
+      }
+      if (!remaining.some((draft) => draft.id === activeId)) {
+        setActiveId(remaining[0].id);
+      }
+      return remaining;
+    });
+    if (activeBlogId === connection.id) {
+      setActiveBlogId(blogs.find((blog) => blog.id !== connection.id)?.id ?? null);
+    }
+    showMessage("博客连接已移除，文件未做任何改动");
+  };
+
+  const revealBlog = async (connection: BlogConnection) => {
+    if (!window.arumaDesktop) return;
+    try {
+      await window.arumaDesktop.revealBlog(connection);
+    } catch {
+      showMessage("无法打开博客目录");
     }
   };
 
@@ -538,44 +982,92 @@ export default function Home() {
       showMessage("请先填写文章 slug");
       return;
     }
+    const connection = draftBlog ?? activeBlog;
+    if (!connection) {
+      setConnectionManagerOpen(true);
+      showMessage("请先连接博客并为草稿选择目标博客");
+      return;
+    }
     setIsPublishing(true);
     try {
-      const directory = blogHandle ?? (await connectBlog());
-      if (!directory) return;
-      if (directory.requestPermission) {
-        const permission = await directory.requestPermission({ mode: "readwrite" });
-        if (permission !== "granted") {
-          showMessage("需要写入权限才能发布到博客");
-          return;
-        }
-      }
       const safeSlug = normalizeSlug(active.slug);
       if (!safeSlug) {
         showMessage("slug 只能包含文字、数字、连字符或下划线");
         return;
       }
-      if (active.source !== "published") {
+      const publishedArticle = {
+        ...active,
+        draft: false,
+        slug: safeSlug,
+        blogId: connection.id,
+      };
+      const markdown = serializeDraft(publishedArticle);
+
+      if (window.arumaDesktop) {
+        let result = await window.arumaDesktop.publishArticle({
+          connection,
+          slug: safeSlug,
+          markdown,
+          overwrite: false,
+        });
+        if (result.exists) {
+          if (!window.confirm(`“${safeSlug}”已存在，确定覆盖 index.md 吗？`)) {
+            return;
+          }
+          result = await window.arumaDesktop.publishArticle({
+            connection,
+            slug: safeSlug,
+            markdown,
+            overwrite: true,
+          });
+        }
+        if (!result.ok) return;
+      } else {
+        let directory = blogHandlesRef.current.get(connection.id);
+        if (!directory) {
+          directory = (await loadDirectoryHandle(connection.id)) ?? undefined;
+        }
+        if (!directory) {
+          showMessage("需要重新授权目标博客目录");
+          setConnectionManagerOpen(true);
+          return;
+        }
+        const permission = directory.requestPermission
+          ? await directory.requestPermission({ mode: "readwrite" })
+          : "granted";
+        if (permission !== "granted") {
+          showMessage("需要写入权限才能发布到博客");
+          return;
+        }
         try {
           await directory.getDirectoryHandle(safeSlug);
-          if (!window.confirm(`“${safeSlug}”已存在，确定覆盖 index.md 吗？`)) return;
+          if (!window.confirm(`“${safeSlug}”已存在，确定覆盖 index.md 吗？`)) {
+            return;
+          }
         } catch {
           // A new article is expected not to exist yet.
         }
+        const articleDirectory = await directory.getDirectoryHandle(safeSlug, {
+          create: true,
+        });
+        const fileHandle = await articleDirectory.getFileHandle("index.md", {
+          create: true,
+        });
+        const writable = await fileHandle.createWritable();
+        await writable.write(markdown);
+        await writable.close();
       }
-      const articleDirectory = await directory.getDirectoryHandle(safeSlug, {
-        create: true,
+
+      setActiveBlogId(connection.id);
+      updateActive({
+        draft: false,
+        slug: safeSlug,
+        source: "published",
+        blogId: connection.id,
       });
-      const fileHandle = await articleDirectory.getFileHandle("index.md", {
-        create: true,
-      });
-      const writable = await fileHandle.createWritable();
-      const publishedArticle = { ...active, draft: false, slug: safeSlug };
-      await writable.write(serializeDraft(publishedArticle));
-      await writable.close();
-      updateActive({ draft: false, slug: safeSlug, source: "published" });
-      showMessage("文章已写入 Aruma，可以去预览或提交了");
-    } catch {
-      showMessage("写入失败，请重新连接博客目录后再试");
+      showMessage(`文章已写入 ${connection.name}，可以预览或提交了`);
+    } catch (error) {
+      showMessage((error as Error).message || "写入失败，请检查博客连接");
     } finally {
       setIsPublishing(false);
     }
@@ -643,7 +1135,11 @@ export default function Home() {
             disabled={isPublishing}
           >
             <Sparkles size={16} />
-            {isPublishing ? "正在写入…" : "发布到 Aruma"}
+            {isPublishing
+              ? "正在写入…"
+              : draftBlog
+                ? `发布到 ${draftBlog.name}`
+                : "发布到博客"}
           </button>
           <button
             className="icon-button details-toggle"
@@ -658,12 +1154,11 @@ export default function Home() {
       <div className="workspace">
         <aside className={`sidebar ${sidebarOpen ? "is-open" : "is-closed"}`}>
           <div className="profile-card">
-            <Image
-              src="/aruma-avatar.webp"
+            {/* The desktop renderer bundles this local asset and does not need Next image optimization. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={`${assetRoot}/aruma-avatar.webp`}
               alt="Aruma 博客头像"
-              width={42}
-              height={42}
-              priority
             />
             <div>
               <strong>To The Neri</strong>
@@ -723,7 +1218,10 @@ export default function Home() {
                 <span className="draft-copy">
                   <strong>{draft.title || "无标题文章"}</strong>
                   <small>
-                    {draft.category || "未分类"} · {relativeTime(draft.updatedAt)}
+                    {draft.category || "未分类"} ·{" "}
+                    {blogs.find((blog) => blog.id === draft.blogId)?.name ?? "仅本地"}
+                    {" · "}
+                    {relativeTime(draft.updatedAt)}
                   </small>
                 </span>
                 {draft.draft && <i className="draft-dot" title="草稿" />}
@@ -738,13 +1236,21 @@ export default function Home() {
           </div>
 
           <div className="sidebar-footer">
-            <button onClick={connectBlog} disabled={isConnecting}>
+            <button onClick={() => setConnectionManagerOpen(true)}>
               <FolderHeart size={17} />
               <span>
-                <strong>{blogName || "连接 Aruma 博客"}</strong>
-                <small>{blogName ? "目录已授权" : "读取文章并直接写入"}</small>
+                <strong>{activeBlog?.name || "管理博客连接"}</strong>
+                <small>
+                  {blogs.length
+                    ? `${blogs.length} 个博客 · ${activeBlog?.message ?? "选择当前博客"}`
+                    : "连接后即可读取和发布文章"}
+                </small>
               </span>
-              <i className={blogName ? "status online" : "status"} />
+              <i
+                className={
+                  activeBlog?.status === "connected" ? "status online" : "status"
+                }
+              />
             </button>
             <button onClick={() => fileInputRef.current?.click()}>
               <Upload size={17} />
@@ -916,6 +1422,47 @@ export default function Home() {
           </div>
 
           <div className="details-scroll">
+            <div className="blog-binding-section">
+              <div className="section-title-row">
+                <span>草稿绑定</span>
+                <small>{draftBlog ? "已连接" : "本地"}</small>
+              </div>
+              <label className="blog-select-label">
+                <span>目标博客</span>
+                <select
+                  value={active.blogId ?? ""}
+                  onChange={(event) => {
+                    const blogId = event.target.value || null;
+                    updateActive({ blogId });
+                    if (blogId) setActiveBlogId(blogId);
+                  }}
+                  aria-label="当前草稿的目标博客"
+                >
+                  <option value="">仅保存在本地</option>
+                  {blogs.map((blog) => (
+                    <option key={blog.id} value={blog.id}>
+                      {blog.name}
+                      {blog.status === "connected" ? "" : "（需重连）"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="binding-summary">
+                <HardDrive size={15} />
+                <span>
+                  <strong>{draftBlog?.name ?? "未绑定博客"}</strong>
+                  <small>
+                    {draftBlog?.rootPath ?? "发布前可以随时选择目标博客"}
+                  </small>
+                </span>
+                <button onClick={() => setConnectionManagerOpen(true)}>
+                  管理
+                </button>
+              </div>
+            </div>
+
+            <div className="details-divider" />
+
             <button
               className="section-heading"
               onClick={() => setMetadataOpen((open) => !open)}
@@ -1075,6 +1622,135 @@ export default function Home() {
           </button>
         )}
       </div>
+
+      {connectionManagerOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setConnectionManagerOpen(false);
+            }
+          }}
+        >
+          <section
+            className="connection-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="connection-manager-title"
+          >
+            <header>
+              <div>
+                <span className="modal-kicker">WORKSPACE</span>
+                <h2 id="connection-manager-title">博客连接管理</h2>
+                <p>一个草稿只绑定一个目标博客，移除连接不会删除任何文件。</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setConnectionManagerOpen(false)}
+                aria-label="关闭博客连接管理"
+              >
+                <X size={19} />
+              </button>
+            </header>
+
+            <div className="connection-list">
+              {blogs.map((blog) => (
+                <article
+                  key={blog.id}
+                  className={`connection-card ${
+                    activeBlogId === blog.id ? "is-current" : ""
+                  }`}
+                >
+                  <div className="connection-card-main">
+                    <span
+                      className={`connection-icon status-${blog.status}`}
+                      aria-hidden="true"
+                    >
+                      <FolderHeart size={20} />
+                    </span>
+                    <div>
+                      <div className="connection-name-row">
+                        <strong>{blog.name}</strong>
+                        {activeBlogId === blog.id && <em>当前</em>}
+                      </div>
+                      <span className="connection-path">{blog.rootPath}</span>
+                      <small>
+                        {blog.message} · {blog.articleCount} 篇文章
+                      </small>
+                    </div>
+                  </div>
+                  <div className="connection-actions">
+                    <button
+                      onClick={() => {
+                        setActiveBlogId(blog.id);
+                        updateActive({ blogId: blog.id });
+                        showMessage(`当前草稿已绑定到 ${blog.name}`);
+                      }}
+                    >
+                      <Check size={14} /> 绑定当前草稿
+                    </button>
+                    <button
+                      onClick={() => syncBlog(blog)}
+                      disabled={syncingBlogId === blog.id}
+                    >
+                      <RefreshCw
+                        size={14}
+                        className={syncingBlogId === blog.id ? "spinning" : ""}
+                      />
+                      {syncingBlogId === blog.id ? "同步中" : "同步"}
+                    </button>
+                    {window.arumaDesktop && (
+                      <button onClick={() => revealBlog(blog)}>
+                        <FolderOpen size={14} /> 打开目录
+                      </button>
+                    )}
+                    {blog.status !== "connected" && (
+                      <button onClick={() => connectBlog(blog.id)}>
+                        <FolderHeart size={14} /> 重连
+                      </button>
+                    )}
+                    <button className="danger" onClick={() => removeBlog(blog)}>
+                      <Trash2 size={14} /> 移除
+                    </button>
+                  </div>
+                </article>
+              ))}
+
+              {!blogs.length && (
+                <div className="connection-empty">
+                  <FolderHeart size={30} />
+                  <strong>还没有连接博客</strong>
+                  <span>选择 Aruma 根目录后，编辑器会自动识别文章目录。</span>
+                </div>
+              )}
+            </div>
+
+            <footer>
+              <span>
+                {window.arumaDesktop
+                  ? "桌面版会在本机安全保存连接路径"
+                  : "浏览器可能在重启后要求重新授权目录"}
+              </span>
+              <div>
+                <button
+                  className="secondary-button"
+                  onClick={() => setConnectionManagerOpen(false)}
+                >
+                  完成
+                </button>
+                <button
+                  className="publish-button"
+                  onClick={() => connectBlog()}
+                  disabled={isConnecting}
+                >
+                  <Plus size={16} />
+                  {isConnecting ? "正在连接…" : "添加博客"}
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {toast && (
         <div className="toast" role="status">
