@@ -4,7 +4,7 @@ import "./globals.css";
 
 const title = "Aruma Editor · 把想法写成文章";
 const description =
-  "为 Aruma 博客打造的本地优先 Markdown 写作台，支持草稿、预览、Frontmatter 与一键导出。";
+  "兼容 Aruma 与 Mizuki 的本地优先 Markdown 写作台，支持草稿、预览、Frontmatter 与安全发布。";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();

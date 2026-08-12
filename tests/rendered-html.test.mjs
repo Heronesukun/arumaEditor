@@ -23,7 +23,7 @@ async function render() {
   );
 }
 
-test("server-renders the Aruma writing workspace", async () => {
+test("server-renders the Aruma and Mizuki writing workspace", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -31,6 +31,7 @@ test("server-renders the Aruma writing workspace", async () => {
   const html = await response.text();
   assert.match(html, /<title>Aruma Editor · 把想法写成文章<\/title>/i);
   assert.match(html, /Aruma/);
+  assert.match(html, /Mizuki/);
   assert.match(html, /写下今天的故事/);
   assert.match(html, /新草稿/);
   assert.match(html, /发布到博客/);
@@ -48,6 +49,7 @@ test("removes disposable starter assets and metadata", async () => {
 
   assert.match(page, /serializeDraft/);
   assert.match(page, /showDirectoryPicker/);
+  assert.match(page, /src\/content\/posts/);
   assert.match(layout, /lang="zh-CN"/);
   assert.match(packageJson, /"name": "aruma-editor"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

@@ -1,85 +1,151 @@
 # Aruma Editor
 
-一个为 [Aruma](https://github.com/Heronesukun/Aruma) 博客工作流设计的本地优先 Markdown 写作台。它沿用 Aruma 的粉色强调色、半透明卡片、背景图与排版气质，同时把日常写作需要的 Frontmatter、草稿、预览和发布动作收进一个界面里。
+> 一张安静、离线优先的 Markdown 写作桌，连接你的 Aruma 或 Mizuki 博客，把草稿直接送回内容仓库。
 
-## 功能
+[![Windows Release](https://img.shields.io/github/v/release/Heronesukun/arumaEditor?label=Windows%20Release)](https://github.com/Heronesukun/arumaEditor/releases/latest)
+[![Release build](https://github.com/Heronesukun/arumaEditor/actions/workflows/release.yml/badge.svg)](https://github.com/Heronesukun/arumaEditor/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-f6a8bd.svg)](./LICENSE)
 
-- Markdown 编辑、实时预览与分栏模式
-- 标题、日期、分类、作者、摘要、头图、标签等 Frontmatter 表单
-- 草稿自动保存，支持深色模式和跨次启动恢复
-- 支持管理多个 Aruma 博客连接，并为每篇草稿单独绑定目标博客
-- 可检查连接状态、重新授权、同步文章、打开目录或安全移除连接
-- 导入已有 Markdown，导出符合 Aruma 内容结构的 `.md` 文件
-- 在桌面版或 Chrome / Edge 中连接 Aruma 根目录，读取 `src/content/post` 下的文章
-- 将当前文章直接写入 `src/content/post/{slug}/index.md`
-- 响应式布局、键盘保存快捷键与基础无障碍支持
+![Aruma Editor 社交预览](./public/og.png)
 
-## 直接使用 Windows Release
+Aruma Editor 是为个人博客日常写作准备的本地桌面编辑器。它保留了 Aruma 的粉色、半透明卡片和轻盈排版，同时将草稿管理、Markdown 预览、Frontmatter 表单、多博客连接和本地发布放进一个界面。文章不会经过第三方服务，也不会被上传到编辑器自己的服务器。
 
-从 Release 下载 `ArumaEditor-0.2.0-win-x64.exe` 后双击即可使用，不要求预装 Node.js，也不需要执行命令。它是便携版程序，可以放在桌面、工具目录或移动硬盘中。
+## 下载与使用
 
-桌面版会把草稿、主题和博客连接信息保存在当前 Windows 用户的数据目录中。移动或删除 `.exe` 不会连带删除草稿；移除博客连接也不会删除博客文件。
+前往 [Releases](https://github.com/Heronesukun/arumaEditor/releases/latest) 下载最新的 `ArumaEditor-*-win-x64.exe`，双击即可运行。
+
+- 支持 Windows x64
+- 便携单文件，不需要安装 Node.js
+- 可以放在桌面、工具目录或移动硬盘中
+- 更新可执行文件不会删除已有草稿
+
+Windows 首次运行未签名的个人应用时，SmartScreen 可能要求额外确认。请只从本仓库的 Release 页面下载，并在需要时核对 Release 中的文件来源。
+
+## 支持的博客
+
+编辑器会根据内容目录自动识别博客类型，不需要手动选择模板。
+
+| 博客 | 内容目录 | 可读取的文章结构 | 发布行为 |
+| --- | --- | --- | --- |
+| [Aruma](https://github.com/Heronesukun/Aruma) | `src/content/post` | `slug/index.md` | 新文章写入 `slug/index.md` |
+| [Mizuki](https://github.com/Heronesukun/Mizuki) | `src/content/posts` | `slug/index.md`、`slug.md` | 已有单文件保持原路径；新文章写入 `slug/index.md` |
+
+你可以选择博客项目根目录，也可以直接选择 `src/content/post` 或 `src/content/posts`。其他 Astro 博客只要使用相同目录和 Frontmatter 约定，也可能兼容，但目前正式验证的目标是 Aruma 与 Mizuki。
+
+### 通用 Frontmatter
+
+编辑器维护以下常用字段：
+
+```yaml
+title: 文章标题
+published: 2026-08-12
+pubDate: 2026-08-12
+description: 一句话摘要
+tags:
+  - 随笔
+author: 拾音
+category: 日常
+pinned: false
+draft: false
+heroImage: ./cover.webp
+image: ./cover.webp
+```
+
+`published` / `pubDate` 与 `image` / `heroImage` 会成对输出，分别适配 Mizuki 和 Aruma 的字段命名。读取旧文章时，两种命名都能识别。
+
+## 核心功能
+
+- Markdown 写作、实时预览、分栏和纯预览模式
+- 标题、日期、分类、作者、摘要、头图、标签等可视化 Frontmatter 表单
+- 本地草稿自动保存，重启后继续写作
+- 同时管理多个博客连接，每篇草稿独立绑定发布目标
+- 同步博客现有文章，并从编辑器继续修改
+- 导入、导出标准 Markdown 文件
+- 发布前检查 slug，覆盖现有文件前二次确认
+- 深色模式、字数与阅读时间统计、`Ctrl/Cmd + S` 保存提示
+- 桌面版与 Chrome / Edge 网页模式共用同一套编辑界面
+
+## 推荐工作流
+
+1. 打开左下角的“管理博客连接”。
+2. 选择 Aruma 或 Mizuki 的项目根目录。
+3. 新建草稿，或同步并打开博客中的已有文章。
+4. 在右侧“草稿绑定”中确认目标博客。
+5. 编辑正文和文章信息，点击顶部发布按钮。
+6. 回到博客仓库运行预览，确认页面效果后再提交 Git 变更。
+
+Aruma Editor 只负责编辑内容文件，不会自动运行博客构建、执行 `git commit` 或推送博客仓库。这让每次发布仍然经过你自己的预览和版本管理流程。
+
+## 草稿、连接与文件安全
+
+- 桌面版将草稿、主题和连接信息保存在当前 Windows 用户的数据目录中。
+- 网页版将草稿保存在 `localStorage`，目录句柄保存在 IndexedDB。
+- 只有你通过目录选择器授权过的博客路径才允许写入。
+- 桌面主进程会再次检查 slug 和目标路径，阻止越界写入。
+- Markdown 预览会转义原始 HTML，并拦截危险链接协议。
+- 移除博客连接只清理编辑器关联，不会删除博客文件。
+- 删除已同步文章只会将它从编辑器列表移除，不会删除原文。
+- 覆盖已有 `.md` 文件前始终需要确认。
+
+重要文章仍建议交由博客仓库的 Git 历史长期保存。
 
 ## 从源码运行
 
-要求 Node.js 22.13 或更高版本。
+需要 Node.js 22.13 或更高版本。
 
 ```bash
-npm install
+git clone https://github.com/Heronesukun/arumaEditor.git
+cd arumaEditor
+npm ci
 npm run dev
 ```
 
-打开终端显示的本地地址。网页模式的草稿保存在当前浏览器中，不会自动上传到任何服务。
-
-启动桌面版本：
+桌面开发模式：
 
 ```bash
 npm run desktop:start
 ```
 
-## 推荐工作流
+## 开发命令
 
-1. 点击左下角“管理博客连接”，添加一个或多个 Aruma 根目录。
-2. 在右侧“草稿绑定”中选择这篇文章对应的目标博客。
-3. 新建文章或同步并打开博客中的已有文章。
-4. 在右侧维护文章信息，在中间编辑正文并实时预览。
-5. 点击顶部发布按钮，文章会写入所绑定博客的对应 slug 目录。
-6. 回到 Aruma 仓库预览、检查并自行提交 Git 变更。
+| 命令 | 用途 |
+| --- | --- |
+| `npm run dev` | 启动网页开发环境 |
+| `npm run build` | 构建网页版本 |
+| `npm test` | 构建并执行服务端渲染测试 |
+| `npm run lint` | 运行代码检查 |
+| `npm run desktop:build` | 构建桌面渲染层 |
+| `npm run desktop:smoke` | 验证 Electron 可以启动并渲染编辑器 |
+| `npm run release:win` | 在 `release/` 生成 Windows x64 便携版 |
 
-如果浏览器不支持目录访问，使用“导出 Markdown”并手动放入 Aruma 内容目录即可。为了安全，覆盖已有 slug 前会再次确认；编辑器不会删除博客中的文件。
+## 项目结构
 
-## 常用命令
-
-```bash
-npm run dev      # 启动开发预览
-npm run build    # 生产构建
-npm test         # 构建并执行渲染测试
-npm run lint     # 代码检查
-npm run desktop:smoke  # 桌面版启动检查
-npm run release:win    # 生成 Windows 便携版 Release
+```text
+app/                 Web 页面、编辑器逻辑与样式
+desktop/             Electron 主进程、预加载脚本和桌面入口
+public/              品牌图片与社交预览图
+tests/               服务端渲染测试
+.github/workflows/   Windows Release 自动构建
+build-resources/     桌面应用图标
 ```
 
-推送形如 `v0.2.0` 的 Git 标签后，仓库内的 GitHub Actions 工作流会自动复测、构建 Windows 便携版，并创建对应的 GitHub Release。
+## 发布新版本
 
-## 数据与隐私
-
-- 桌面版草稿和连接信息保存在系统用户数据目录的 `workspace.json` 中。
-- 网页版草稿使用 `localStorage`，目录授权句柄使用 IndexedDB 保存。
-- 博客目录只在你主动选择后才会读取或写入。
-- 覆盖已有 `index.md` 前始终会再次确认。
-- 移除连接只清理编辑器中的关联，不会删除博客文件。
-- 项目不包含分析脚本，也不会把文章内容发送到远端。
-- 重要文章仍建议定期导出，并通过 Aruma 仓库的 Git 历史管理。
-
-## GitHub
-
-仓库已包含适用于 Node、Vinext、Cloudflare 本地状态与环境变量的忽略规则。创建 GitHub 仓库后可添加远端并推送：
+项目使用 `v*` Git 标签驱动 GitHub Actions。推送标签后，工作流会在 Windows 环境中安装依赖、运行测试与代码检查、生成便携版，并自动创建 GitHub Release。
 
 ```bash
-git remote add origin <your-repository-url>
-git push -u origin main
+git tag -a v0.2.1 -m "Aruma Editor 0.2.1"
+git push origin main
+git push origin v0.2.1
 ```
+
+## 已知边界
+
+- 当前桌面 Release 只构建 Windows x64。
+- 编辑器专注 Markdown；MDX 可以作为文本编辑，但不会在预览区执行组件。
+- 博客主题的最终渲染效果应以 Aruma 或 Mizuki 自身的本地预览为准。
+- 网页模式依赖 File System Access API，推荐 Chrome 或 Edge；完整体验优先使用桌面版。
 
 ## License
 
-项目代码可按 MIT License 使用。随项目复用的背景与头像来自你的 Aruma 博客，请按原素材授权范围使用。
+源代码采用 [MIT License](./LICENSE)。仓库中的背景与头像素材来自 Heronesukun 的 Aruma 博客，二次使用时请同时遵守原素材的授权范围。

@@ -52,6 +52,7 @@ import {
 
 type ViewMode = "write" | "split" | "preview";
 type ArticleSource = "draft" | "imported" | "published";
+type BlogType = "aruma" | "mizuki" | "compatible";
 
 function escapeHtml(value: string) {
   return value.replace(
@@ -112,6 +113,7 @@ type Draft = {
   updatedAt: number;
   source: ArticleSource;
   blogId: string | null;
+  articlePath: string | null;
 };
 
 type BlogStatus = "connected" | "permission" | "missing";
@@ -126,12 +128,14 @@ type BlogConnection = {
   articleCount: number;
   lastConnectedAt: number;
   lastSyncedAt: number;
+  blogType?: BlogType;
 };
 
 type BlogArticle = {
   slug: string;
   text: string;
   lastModified: number;
+  articlePath: string;
 };
 
 type BlogScanResult = {
@@ -159,6 +163,7 @@ type DesktopBridge = {
     slug: string;
     markdown: string;
     overwrite: boolean;
+    articlePath: string | null;
   }) => Promise<{ ok: boolean; exists: boolean; target: string }>;
   revealBlog: (connection: BlogConnection) => Promise<string>;
   getVersion: () => Promise<string>;
@@ -183,8 +188,20 @@ type DirectoryHandleLike = {
   }>;
   requestPermission?: (options: { mode: "readwrite" }) => Promise<string>;
   queryPermission?: (options: { mode: "readwrite" }) => Promise<string>;
-  values?: () => AsyncIterable<DirectoryHandleLike>;
+  values?: () => AsyncIterable<DirectoryEntryHandleLike>;
 };
+
+type FileHandleLike = {
+  kind: "file";
+  name: string;
+  getFile: () => Promise<File>;
+  createWritable: () => Promise<{
+    write: (data: string | Blob) => Promise<void>;
+    close: () => Promise<void>;
+  }>;
+};
+
+type DirectoryEntryHandleLike = DirectoryHandleLike | FileHandleLike;
 
 declare global {
   interface Window {
@@ -226,6 +243,7 @@ function createDraft(blogId: string | null = null): Draft {
     updatedAt: now,
     source: "draft",
     blogId,
+    articlePath: null,
   };
 }
 
@@ -249,6 +267,7 @@ const starterDraft: Draft = {
   updatedAt: 0,
   source: "draft",
   blogId: null,
+  articlePath: null,
 };
 
 function cleanDate(value: unknown) {
@@ -293,17 +312,22 @@ function parseMarkdownDocument(
     category: String(data.category ?? "日常"),
     pinned: Boolean(data.pinned),
     draft: data.draft === undefined ? true : Boolean(data.draft),
-    heroImage: String(data.heroImage ?? ""),
+    heroImage: String(data.heroImage ?? data.image ?? ""),
     content,
     createdAt: now,
     updatedAt: now,
     source: "imported",
     blogId,
+    articlePath: null,
   };
 }
 
 function normalizeDraft(value: Draft): Draft {
-  return { ...value, blogId: value.blogId ?? null };
+  return {
+    ...value,
+    blogId: value.blogId ?? null,
+    articlePath: value.articlePath ?? null,
+  };
 }
 
 function openHandleDatabase() {
@@ -364,7 +388,10 @@ function serializeDraft(article: Draft) {
     draft: article.draft,
     category: article.category,
   };
-  if (article.heroImage.trim()) metadata.heroImage = article.heroImage.trim();
+  if (article.heroImage.trim()) {
+    metadata.heroImage = article.heroImage.trim();
+    metadata.image = article.heroImage.trim();
+  }
 
   const yaml = dump(metadata, {
     noRefs: true,
@@ -405,6 +432,13 @@ function normalizeSlug(value: string) {
     .replace(/[^a-z0-9\u4e00-\u9fff-_]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+function existingArticlePath(articlePath: string | null, slug: string) {
+  if (articlePath === `${slug}.md` || articlePath === `${slug}/index.md`) {
+    return articlePath;
+  }
+  return `${slug}/index.md`;
 }
 
 export default function Home() {
@@ -724,10 +758,28 @@ export default function Home() {
   };
 
   const resolvePostDirectory = async (root: DirectoryHandleLike) => {
-    if (root.name === "post") return root;
+    if (root.name === "post" || root.name === "posts") {
+      return {
+        directory: root,
+        postPath: `src/content/${root.name}`,
+        blogType: (root.name === "posts" ? "mizuki" : "aruma") as BlogType,
+      };
+    }
     const src = await root.getDirectoryHandle("src");
     const content = await src.getDirectoryHandle("content");
-    return content.getDirectoryHandle("post");
+    try {
+      return {
+        directory: await content.getDirectoryHandle("post"),
+        postPath: "src/content/post",
+        blogType: "aruma" as BlogType,
+      };
+    } catch {
+      return {
+        directory: await content.getDirectoryHandle("posts"),
+        postPath: "src/content/posts",
+        blogType: "mizuki" as BlogType,
+      };
+    }
   };
 
   const scanBrowserBlog = async (
@@ -739,14 +791,26 @@ export default function Home() {
     }
     const articles: BlogArticle[] = [];
     for await (const entry of postDirectory.values()) {
-      if (entry.kind !== "directory") continue;
       try {
-        const articleFile = await entry.getFileHandle("index.md");
-        const file = await articleFile.getFile();
+        let file: File;
+        let slug: string;
+        let articlePath: string;
+        if (entry.kind === "file") {
+          if (!/\.md$/i.test(entry.name)) continue;
+          file = await entry.getFile();
+          slug = entry.name.replace(/\.md$/i, "");
+          articlePath = entry.name;
+        } else {
+          const articleFile = await entry.getFileHandle("index.md");
+          file = await articleFile.getFile();
+          slug = entry.name;
+          articlePath = `${entry.name}/index.md`;
+        }
         articles.push({
-          slug: entry.name,
+          slug,
           text: await file.text(),
           lastModified: file.lastModified,
+          articlePath,
         });
       } catch {
         // Ignore non-article folders.
@@ -780,6 +844,7 @@ export default function Home() {
       parsed.source = "published";
       parsed.createdAt = article.lastModified;
       parsed.updatedAt = article.lastModified;
+      parsed.articlePath = article.articlePath;
       return parsed;
     });
 
@@ -834,25 +899,26 @@ export default function Home() {
           return null;
         }
         const root = await window.showDirectoryPicker({
-          id: "aruma-blog",
+          id: "compatible-blog",
           mode: "readwrite",
         });
-        const postDirectory = await resolvePostDirectory(root);
+        const resolved = await resolvePostDirectory(root);
         const id = replacedId ?? `web-${Date.now().toString(36)}`;
         const connection: BlogConnection = {
           id,
           name: root.name,
           rootPath: root.name,
-          postPath: "src/content/post",
+          postPath: resolved.postPath,
           status: "connected",
           message: "目录可读写",
           articleCount: 0,
           lastConnectedAt: Date.now(),
           lastSyncedAt: Date.now(),
+          blogType: resolved.blogType,
         };
-        blogHandlesRef.current.set(id, postDirectory);
-        await saveDirectoryHandle(id, postDirectory);
-        result = await scanBrowserBlog(postDirectory, connection);
+        blogHandlesRef.current.set(id, resolved.directory);
+        await saveDirectoryHandle(id, resolved.directory);
+        result = await scanBrowserBlog(resolved.directory, connection);
       }
 
       if (!result) return null;
@@ -863,7 +929,10 @@ export default function Home() {
       return result.connection;
     } catch (error) {
       if ((error as Error).name !== "AbortError") {
-        showMessage((error as Error).message || "没有找到 Aruma 博客目录");
+        showMessage(
+          (error as Error).message ||
+            "没有找到 src/content/post 或 src/content/posts",
+        );
       }
       return null;
     } finally {
@@ -1002,6 +1071,7 @@ export default function Home() {
         blogId: connection.id,
       };
       const markdown = serializeDraft(publishedArticle);
+      const articlePath = existingArticlePath(active.articlePath, safeSlug);
 
       if (window.arumaDesktop) {
         let result = await window.arumaDesktop.publishArticle({
@@ -1009,9 +1079,10 @@ export default function Home() {
           slug: safeSlug,
           markdown,
           overwrite: false,
+          articlePath,
         });
         if (result.exists) {
-          if (!window.confirm(`“${safeSlug}”已存在，确定覆盖 index.md 吗？`)) {
+          if (!window.confirm(`“${articlePath}”已存在，确定覆盖吗？`)) {
             return;
           }
           result = await window.arumaDesktop.publishArticle({
@@ -1019,6 +1090,7 @@ export default function Home() {
             slug: safeSlug,
             markdown,
             overwrite: true,
+            articlePath,
           });
         }
         if (!result.ok) return;
@@ -1039,20 +1111,24 @@ export default function Home() {
           showMessage("需要写入权限才能发布到博客");
           return;
         }
+        const isDirectFile = articlePath === `${safeSlug}.md`;
         try {
-          await directory.getDirectoryHandle(safeSlug);
-          if (!window.confirm(`“${safeSlug}”已存在，确定覆盖 index.md 吗？`)) {
+          if (isDirectFile) {
+            await directory.getFileHandle(articlePath);
+          } else {
+            await directory.getDirectoryHandle(safeSlug);
+          }
+          if (!window.confirm(`“${articlePath}”已存在，确定覆盖吗？`)) {
             return;
           }
         } catch {
           // A new article is expected not to exist yet.
         }
-        const articleDirectory = await directory.getDirectoryHandle(safeSlug, {
-          create: true,
-        });
-        const fileHandle = await articleDirectory.getFileHandle("index.md", {
-          create: true,
-        });
+        const fileHandle = isDirectFile
+          ? await directory.getFileHandle(articlePath, { create: true })
+          : await (
+              await directory.getDirectoryHandle(safeSlug, { create: true })
+            ).getFileHandle("index.md", { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(markdown);
         await writable.close();
@@ -1064,6 +1140,7 @@ export default function Home() {
         slug: safeSlug,
         source: "published",
         blogId: connection.id,
+        articlePath,
       });
       showMessage(`文章已写入 ${connection.name}，可以预览或提交了`);
     } catch (error) {
@@ -1720,7 +1797,9 @@ export default function Home() {
                 <div className="connection-empty">
                   <FolderHeart size={30} />
                   <strong>还没有连接博客</strong>
-                  <span>选择 Aruma 根目录后，编辑器会自动识别文章目录。</span>
+                  <span>
+                    选择 Aruma 或 Mizuki 根目录，编辑器会自动识别文章目录。
+                  </span>
                 </div>
               )}
             </div>

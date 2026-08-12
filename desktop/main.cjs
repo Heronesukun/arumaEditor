@@ -109,16 +109,27 @@ function sanitizeSavedBlogs(blogs) {
 
 async function resolveBlogDirectory(selectedPath) {
   const selected = path.resolve(selectedPath);
+  const selectedName = path.basename(selected).toLowerCase();
   const candidates = [
     {
       rootPath: selected,
       postPath: path.join(selected, "src", "content", "post"),
+      blogType: "aruma",
     },
     {
-      rootPath: path.resolve(selected, "..", "..", ".."),
-      postPath: selected,
+      rootPath: selected,
+      postPath: path.join(selected, "src", "content", "posts"),
+      blogType: "mizuki",
     },
   ];
+
+  if (selectedName === "post" || selectedName === "posts") {
+    candidates.unshift({
+      rootPath: path.resolve(selected, "..", "..", ".."),
+      postPath: selected,
+      blogType: selectedName === "posts" ? "mizuki" : "aruma",
+    });
+  }
 
   for (const candidate of candidates) {
     if (await exists(candidate.postPath)) {
@@ -126,7 +137,7 @@ async function resolveBlogDirectory(selectedPath) {
       if (stat.isDirectory()) return candidate;
     }
   }
-  throw new Error("所选目录中没有找到 src/content/post");
+  throw new Error("所选目录中没有找到 src/content/post 或 src/content/posts");
 }
 
 function connectionId(rootPath) {
@@ -159,17 +170,25 @@ async function scanBlog(connection) {
   const articles = [];
   const entries = await fs.readdir(connection.postPath, { withFileTypes: true });
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const articlePath = path.join(connection.postPath, entry.name, "index.md");
+    if (!entry.isDirectory() && !(entry.isFile() && /\.md$/i.test(entry.name))) {
+      continue;
+    }
+    const relativeArticlePath = entry.isDirectory()
+      ? `${entry.name}/index.md`
+      : entry.name;
+    const articlePath = path.join(connection.postPath, relativeArticlePath);
     try {
       const [text, stat] = await Promise.all([
         fs.readFile(articlePath, "utf8"),
         fs.stat(articlePath),
       ]);
       articles.push({
-        slug: entry.name,
+        slug: entry.isDirectory()
+          ? entry.name
+          : entry.name.replace(/\.md$/i, ""),
         text,
         lastModified: stat.mtimeMs,
+        articlePath: relativeArticlePath,
       });
     } catch {
       // A folder without index.md is not an article and can be ignored.
@@ -191,7 +210,7 @@ async function scanBlog(connection) {
 
 async function addBlog(window) {
   const result = await dialog.showOpenDialog(window, {
-    title: "选择 Aruma 博客根目录",
+    title: "选择 Aruma 或 Mizuki 博客根目录",
     buttonLabel: "连接这个博客",
     properties: ["openDirectory"],
   });
@@ -209,6 +228,7 @@ async function addBlog(window) {
     articleCount: 0,
     lastConnectedAt: now,
     lastSyncedAt: now,
+    blogType: resolved.blogType,
   };
   const scanned = await scanBlog(connection);
   rememberConnection(scanned.connection);
@@ -216,7 +236,7 @@ async function addBlog(window) {
 }
 
 async function publishArticle(request) {
-  const { connection, slug, markdown, overwrite } = request ?? {};
+  const { connection, slug, markdown, overwrite, articlePath } = request ?? {};
   const validation = await validateConnection(connection);
   if (validation.status !== "connected") {
     throw new Error(validation.message);
@@ -227,19 +247,27 @@ async function publishArticle(request) {
   if (typeof markdown !== "string") throw new Error("文章内容为空");
 
   const postRoot = path.resolve(connection.postPath);
-  const articleDirectory = path.resolve(postRoot, slug);
-  if (path.dirname(articleDirectory) !== postRoot) {
+  const normalizedArticlePath = String(articlePath ?? "").replace(/\\/g, "/");
+  const allowedPaths = new Set([`${slug}.md`, `${slug}/index.md`]);
+  const targetRelative = allowedPaths.has(normalizedArticlePath)
+    ? normalizedArticlePath
+    : `${slug}/index.md`;
+  const target = path.resolve(postRoot, ...targetRelative.split("/"));
+  const relativeTarget = path.relative(postRoot, target);
+  if (relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) {
     throw new Error("文章路径超出博客目录");
   }
 
-  const target = path.join(articleDirectory, "index.md");
   const alreadyExists = await exists(target);
   if (alreadyExists && !overwrite) {
     return { ok: false, exists: true, target };
   }
 
-  await fs.mkdir(articleDirectory, { recursive: true });
-  const temporary = path.join(articleDirectory, `.index.${process.pid}.tmp`);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.tmp`,
+  );
   await fs.writeFile(temporary, markdown, "utf8");
   await fs.copyFile(temporary, target);
   await fs.unlink(temporary).catch(() => {});
@@ -313,14 +341,40 @@ function createWindow() {
   if (smokeTest) {
     mainWindow.webContents.once("did-finish-load", async () => {
       try {
-        const result = await mainWindow.webContents.executeJavaScript(`({
+        const renderer = await mainWindow.webContents.executeJavaScript(`({
           hasRoot: Boolean(document.querySelector('#root')),
           hasEditor: document.body.innerText.includes('博客连接管理') ||
             document.body.innerText.includes('管理博客连接'),
           hasTitle: document.body.innerText.includes('写下今天的故事')
         })`);
+        const smokeBlogPath = process.env.ARUMA_EDITOR_SMOKE_BLOG;
+        let blogArticleCount = null;
+        let blogType = null;
+        if (smokeBlogPath) {
+          const resolved = await resolveBlogDirectory(smokeBlogPath);
+          const scanned = await scanBlog({
+            ...resolved,
+            id: connectionId(resolved.rootPath),
+            name: path.basename(resolved.rootPath),
+            status: "connected",
+            message: "目录可读写",
+            articleCount: 0,
+            lastConnectedAt: Date.now(),
+            lastSyncedAt: Date.now(),
+          });
+          blogArticleCount = scanned.articles.length;
+          blogType = resolved.blogType;
+        }
+        const result = { ...renderer, blogArticleCount, blogType };
         console.log(`DESKTOP_SMOKE ${JSON.stringify(result)}`);
-        app.exit(result.hasRoot && result.hasEditor && result.hasTitle ? 0 : 1);
+        app.exit(
+          result.hasRoot &&
+            result.hasEditor &&
+            result.hasTitle &&
+            (!smokeBlogPath || result.blogArticleCount > 0)
+            ? 0
+            : 1,
+        );
       } catch (error) {
         console.error("DESKTOP_SMOKE_FAILED", error);
         app.exit(1);

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1 - 2026-08-12
+
+### Added
+
+- 正式支持 Mizuki 的 `src/content/posts` 内容目录。
+- 同步时同时识别 `slug/index.md` 与内容目录根部的 `slug.md`。
+- 从 Mizuki 同步的单文件文章会继续发布回原文件，新文章采用便于管理素材的 `slug/index.md` 结构。
+- 通用 Frontmatter 同时输出 `heroImage` 与 `image`，兼容 Aruma 和 Mizuki 的头图字段。
+
+### Changed
+
+- 博客连接器会自动识别 Aruma 与 Mizuki，无需手动选择博客类型。
+- 重写 README，补充下载安装、兼容范围、数据安全和开发发布说明。
+
 ## 0.2.0 - 2026-08-11
 
 ### Added
