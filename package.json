@@ -1,7 +1,7 @@
 {
   "name": "aruma-editor",
-  "version": "0.2.1",
-  "description": "A local-first Markdown writing desk for Aruma blogs.",
+  "version": "0.3.0",
+  "description": "A reliable local-first Markdown writing desk for Aruma and Mizuki blogs.",
   "author": "Heronesukun",
   "private": true,
   "main": "desktop/main.cjs",
@@ -12,7 +12,7 @@
     "dev": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
     "build": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "cross-env WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/article-document.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern desktop-dist --ignore-pattern release",
     "desktop:build": "vite build --config desktop/vite.config.ts",
     "desktop:start": "npm run desktop:build && electron .",

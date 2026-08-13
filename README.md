@@ -8,7 +8,7 @@
 
 ![Aruma Editor 社交预览](./public/og.png)
 
-Aruma Editor 是为个人博客日常写作准备的本地桌面编辑器。它保留了 Aruma 的粉色、半透明卡片和轻盈排版，同时将草稿管理、Markdown 预览、Frontmatter 表单、多博客连接和本地发布放进一个界面。文章不会经过第三方服务，也不会被上传到编辑器自己的服务器。
+Aruma Editor 是为个人博客日常写作准备的本地桌面编辑器。它保留了 Aruma 的粉色、半透明卡片和轻盈排版，同时将草稿管理、Markdown 预览、Frontmatter 表单、多博客连接、安全差异检查和本地发布放进一个界面。文章不会经过第三方服务，也不会被上传到编辑器自己的服务器。
 
 ## 下载与使用
 
@@ -51,7 +51,9 @@ heroImage: ./cover.webp
 image: ./cover.webp
 ```
 
-`published` / `pubDate` 与 `image` / `heroImage` 会成对输出，分别适配 Mizuki 和 Aruma 的字段命名。读取旧文章时，两种命名都能识别。
+新文章会同时写入 `published` / `pubDate` 与 `image` / `heroImage`，分别适配 Mizuki 和 Aruma。编辑已有文章时会沿用它原本使用的字段命名，两种命名都能识别。
+
+已有文章中的其他字段会继续保留。例如 Mizuki 的 `encrypted`、`password`、`alias`、`permalink`、`lang`、`sourceLink` 和授权信息不会因为使用编辑器修改正文而丢失。
 
 ## 核心功能
 
@@ -60,6 +62,9 @@ image: ./cover.webp
 - 本地草稿自动保存，重启后继续写作
 - 同时管理多个博客连接，每篇草稿独立绑定发布目标
 - 同步博客现有文章，并从编辑器继续修改
+- 发布前展示 Markdown 与 Frontmatter 差异
+- 检测外部工具造成的文件变化，避免覆盖较新的磁盘版本
+- 每篇文章保留最多 20 个本地历史版本，可随时恢复
 - 导入、导出标准 Markdown 文件
 - 发布前检查 slug，覆盖现有文件前二次确认
 - 深色模式、字数与阅读时间统计、`Ctrl/Cmd + S` 保存提示
@@ -71,8 +76,9 @@ image: ./cover.webp
 2. 选择 Aruma 或 Mizuki 的项目根目录。
 3. 新建草稿，或同步并打开博客中的已有文章。
 4. 在右侧“草稿绑定”中确认目标博客。
-5. 编辑正文和文章信息，点击顶部发布按钮。
-6. 回到博客仓库运行预览，确认页面效果后再提交 Git 变更。
+5. 编辑正文和文章信息，点击顶部“检查并发布”。
+6. 查看目标文件、草稿状态和增删差异，再确认写入。
+7. 回到博客仓库运行预览，确认页面效果后再提交 Git 变更。
 
 Aruma Editor 只负责编辑内容文件，不会自动运行博客构建、执行 `git commit` 或推送博客仓库。这让每次发布仍然经过你自己的预览和版本管理流程。
 
@@ -82,6 +88,9 @@ Aruma Editor 只负责编辑内容文件，不会自动运行博客构建、执�
 - 网页版将草稿保存在 `localStorage`，目录句柄保存在 IndexedDB。
 - 只有你通过目录选择器授权过的博客路径才允许写入。
 - 桌面主进程会再次检查 slug 和目标路径，阻止越界写入。
+- 发布使用磁盘文件哈希作为写入条件，确认后发生的新变化不会被覆盖。
+- 工作区保留上一份完整文件和定期轮换备份；覆盖文章前还会保存文件副本。
+- 停止编辑 15 秒会创建自动历史版本，`Ctrl/Cmd + S` 会立即保存并建立手动版本。
 - Markdown 预览会转义原始 HTML，并拦截危险链接协议。
 - 移除博客连接只清理编辑器关联，不会删除博客文件。
 - 删除已同步文章只会将它从编辑器列表移除，不会删除原文。
@@ -115,7 +124,7 @@ npm run desktop:start
 | `npm test` | 构建并执行服务端渲染测试 |
 | `npm run lint` | 运行代码检查 |
 | `npm run desktop:build` | 构建桌面渲染层 |
-| `npm run desktop:smoke` | 验证 Electron 可以启动并渲染编辑器 |
+| `npm run desktop:smoke` | 验证 Electron 渲染、条件写入和冲突阻止 |
 | `npm run release:win` | 在 `release/` 生成 Windows x64 便携版 |
 
 ## 项目结构
@@ -134,9 +143,9 @@ build-resources/     桌面应用图标
 项目使用 `v*` Git 标签驱动 GitHub Actions。推送标签后，工作流会在 Windows 环境中安装依赖、运行测试与代码检查、生成便携版，并自动创建 GitHub Release。
 
 ```bash
-git tag -a v0.2.1 -m "Aruma Editor 0.2.1"
+git tag -a v0.3.0 -m "Aruma Editor 0.3.0"
 git push origin main
-git push origin v0.2.1
+git push origin v0.3.0
 ```
 
 ## 已知边界

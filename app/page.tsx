@@ -13,9 +13,11 @@ import {
   FileText,
   FolderOpen,
   FolderHeart,
+  GitCompare,
   Hash,
   HardDrive,
   Heading2,
+  History,
   Image as ImageIcon,
   Italic,
   Link2,
@@ -29,8 +31,10 @@ import {
   Plus,
   Quote,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings2,
+  ShieldAlert,
   Sparkles,
   Sun,
   Tag,
@@ -38,8 +42,15 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { dump, load } from "js-yaml";
 import { marked } from "marked";
+import {
+  appendDraftRevision,
+  buildLineDiff,
+  hashText,
+  mergeArticleFrontmatter,
+  parseMarkdownSource,
+  serializeArticleSource,
+} from "../lib/article-document.mjs";
 import {
   ChangeEvent,
   KeyboardEvent,
@@ -53,6 +64,8 @@ import {
 type ViewMode = "write" | "split" | "preview";
 type ArticleSource = "draft" | "imported" | "published";
 type BlogType = "aruma" | "mizuki" | "compatible";
+type RevisionReason = "自动备份" | "手动保存" | "发布前" | "恢复前";
+type DiffType = "equal" | "add" | "remove";
 
 function escapeHtml(value: string) {
   return value.replace(
@@ -114,6 +127,18 @@ type Draft = {
   source: ArticleSource;
   blogId: string | null;
   articlePath: string | null;
+  frontmatter: Record<string, unknown>;
+  sourceHash: string | null;
+  sourceModifiedAt: number | null;
+  externalConflict: boolean;
+};
+
+type DraftRevision = {
+  id: string;
+  draftId: string;
+  createdAt: number;
+  reason: RevisionReason;
+  snapshot: Draft;
 };
 
 type BlogStatus = "connected" | "permission" | "missing";
@@ -136,6 +161,7 @@ type BlogArticle = {
   text: string;
   lastModified: number;
   articlePath: string;
+  contentHash: string;
 };
 
 type BlogScanResult = {
@@ -150,6 +176,42 @@ type WorkspaceSnapshot = {
   isDark: boolean;
   blogs: BlogConnection[];
   activeBlogId: string | null;
+  history: DraftRevision[];
+};
+
+type ArticleInspection = {
+  exists: boolean;
+  text: string;
+  hash: string | null;
+  lastModified: number | null;
+  target: string;
+};
+
+type PublishResult = {
+  ok: boolean;
+  exists: boolean;
+  target: string;
+  hash?: string;
+  lastModified?: number;
+  conflict?: boolean;
+  inspection?: ArticleInspection;
+};
+
+type DiffLine = {
+  type: DiffType;
+  text: string;
+  oldLine: number | null;
+  newLine: number | null;
+};
+
+type PublishPreview = {
+  connection: BlogConnection;
+  article: Draft;
+  markdown: string;
+  articlePath: string;
+  inspection: ArticleInspection;
+  conflict: boolean;
+  diff: DiffLine[];
 };
 
 type DesktopBridge = {
@@ -158,13 +220,19 @@ type DesktopBridge = {
   saveWorkspace: (workspace: WorkspaceSnapshot) => Promise<{ ok: boolean }>;
   addBlog: () => Promise<BlogScanResult | null>;
   scanBlog: (connection: BlogConnection) => Promise<BlogScanResult>;
+  inspectArticle: (request: {
+    connection: BlogConnection;
+    slug: string;
+    articlePath: string | null;
+  }) => Promise<ArticleInspection>;
   publishArticle: (request: {
     connection: BlogConnection;
     slug: string;
     markdown: string;
     overwrite: boolean;
     articlePath: string | null;
-  }) => Promise<{ ok: boolean; exists: boolean; target: string }>;
+    expectedHash: string | null;
+  }) => Promise<PublishResult>;
   revealBlog: (connection: BlogConnection) => Promise<string>;
   getVersion: () => Promise<string>;
 };
@@ -218,6 +286,7 @@ const ACTIVE_KEY = "aruma-editor:active:v1";
 const THEME_KEY = "aruma-editor:theme:v1";
 const BLOGS_KEY = "aruma-editor:blogs:v1";
 const ACTIVE_BLOG_KEY = "aruma-editor:active-blog:v1";
+const HISTORY_KEY = "aruma-editor:history:v1";
 const HANDLE_DATABASE = "aruma-editor-handles";
 
 function today() {
@@ -244,6 +313,10 @@ function createDraft(blogId: string | null = null): Draft {
     source: "draft",
     blogId,
     articlePath: null,
+    frontmatter: {},
+    sourceHash: null,
+    sourceModifiedAt: null,
+    externalConflict: false,
   };
 }
 
@@ -268,6 +341,10 @@ const starterDraft: Draft = {
   source: "draft",
   blogId: null,
   articlePath: null,
+  frontmatter: {},
+  sourceHash: null,
+  sourceModifiedAt: null,
+  externalConflict: false,
 };
 
 function cleanDate(value: unknown) {
@@ -282,25 +359,16 @@ function parseMarkdownDocument(
   blogId: string | null = null,
 ): Draft {
   const now = Date.now();
-  const frontmatter = text.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?/);
-  let data: Record<string, unknown> = {};
-  let content = text;
-
-  if (frontmatter) {
-    try {
-      data = (load(frontmatter[1]) as Record<string, unknown>) ?? {};
-      content = text.slice(frontmatter[0].length);
-    } catch {
-      data = {};
-    }
-  }
+  const parsed = parseMarkdownSource(text);
+  const data = parsed.frontmatter as Record<string, unknown>;
+  const content = parsed.content;
 
   const fileSlug = fileName.replace(/\.(md|markdown)$/i, "");
   return {
     id: `import-${now}-${Math.random().toString(36).slice(2, 7)}`,
     title: String(data.title ?? fileSlug ?? "导入的文章"),
     slug: String(data.slug ?? fileSlug ?? `article-${today()}`),
-    published: cleanDate(data.published ?? data.pubDate),
+    published: cleanDate(data.published ?? data.pubDate ?? data.date),
     description: String(data.description ?? ""),
     tags: Array.isArray(data.tags)
       ? data.tags.map(String)
@@ -319,6 +387,10 @@ function parseMarkdownDocument(
     source: "imported",
     blogId,
     articlePath: null,
+    frontmatter: data,
+    sourceHash: null,
+    sourceModifiedAt: null,
+    externalConflict: false,
   };
 }
 
@@ -327,6 +399,13 @@ function normalizeDraft(value: Draft): Draft {
     ...value,
     blogId: value.blogId ?? null,
     articlePath: value.articlePath ?? null,
+    frontmatter:
+      value.frontmatter && typeof value.frontmatter === "object"
+        ? value.frontmatter
+        : {},
+    sourceHash: value.sourceHash ?? null,
+    sourceModifiedAt: value.sourceModifiedAt ?? null,
+    externalConflict: value.externalConflict ?? false,
   };
 }
 
@@ -377,29 +456,56 @@ async function deleteDirectoryHandle(id: string) {
 }
 
 function serializeDraft(article: Draft) {
-  const metadata: Record<string, unknown> = {
-    title: article.title,
-    published: article.published,
-    pubDate: article.published,
-    pinned: article.pinned,
-    description: article.description,
-    tags: article.tags,
-    author: article.author,
-    draft: article.draft,
-    category: article.category,
-  };
-  if (article.heroImage.trim()) {
-    metadata.heroImage = article.heroImage.trim();
-    metadata.image = article.heroImage.trim();
-  }
+  return serializeArticleSource(article);
+}
 
-  const yaml = dump(metadata, {
-    noRefs: true,
-    lineWidth: -1,
-    quotingType: '"',
-    forceQuotes: false,
-  }).trim();
-  return `---\n${yaml}\n---\n\n${article.content.trimEnd()}\n`;
+function appendRevision(
+  revisions: DraftRevision[],
+  draft: Draft,
+  reason: RevisionReason,
+) {
+  return appendDraftRevision(revisions, draft, reason) as DraftRevision[];
+}
+
+function diffSummary(lines: DiffLine[]) {
+  return lines.reduce(
+    (summary, line) => {
+      if (line.type === "add") summary.added += 1;
+      if (line.type === "remove") summary.removed += 1;
+      return summary;
+    },
+    { added: 0, removed: 0 },
+  );
+}
+
+function compactDiff(lines: DiffLine[], context = 3) {
+  const visible = new Set<number>();
+  lines.forEach((line, index) => {
+    if (line.type === "equal") return;
+    for (
+      let nearby = Math.max(0, index - context);
+      nearby <= Math.min(lines.length - 1, index + context);
+      nearby += 1
+    ) {
+      visible.add(nearby);
+    }
+  });
+  if (!visible.size) return lines.slice(0, 12);
+  const compacted: DiffLine[] = [];
+  let previous = -2;
+  for (const index of [...visible].sort((a, b) => a - b)) {
+    if (index > previous + 1) {
+      compacted.push({
+        type: "equal",
+        text: "… 未变化的内容 …",
+        oldLine: null,
+        newLine: null,
+      });
+    }
+    compacted.push(lines[index]);
+    previous = index;
+  }
+  return compacted;
 }
 
 function relativeTime(timestamp: number) {
@@ -461,6 +567,12 @@ export default function Home() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [syncingBlogId, setSyncingBlogId] = useState<string | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
+  const [history, setHistory] = useState<DraftRevision[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [publishPreview, setPublishPreview] = useState<PublishPreview | null>(
+    null,
+  );
+  const [isInspecting, setIsInspecting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const blogHandlesRef = useRef(new Map<string, DirectoryHandleLike>());
@@ -481,6 +593,7 @@ export default function Home() {
         let restoredBlogs: BlogConnection[] = [];
         let restoredActiveBlogId: string | null = null;
         let restoredTheme = false;
+        let restoredHistory: DraftRevision[] = [];
 
         if (window.arumaDesktop) {
           const workspace = await window.arumaDesktop.loadWorkspace();
@@ -489,6 +602,9 @@ export default function Home() {
           restoredBlogs = workspace.blogs;
           restoredActiveBlogId = workspace.activeBlogId;
           restoredTheme = workspace.isDark;
+          restoredHistory = Array.isArray(workspace.history)
+            ? workspace.history
+            : [];
         } else {
           const storedDrafts = localStorage.getItem(STORAGE_KEY);
           const storedBlogs = localStorage.getItem(BLOGS_KEY);
@@ -498,6 +614,10 @@ export default function Home() {
           restoredActiveId = localStorage.getItem(ACTIVE_KEY);
           restoredActiveBlogId = localStorage.getItem(ACTIVE_BLOG_KEY);
           restoredTheme = localStorage.getItem(THEME_KEY) === "dark";
+          const storedHistory = localStorage.getItem(HISTORY_KEY);
+          restoredHistory = storedHistory
+            ? (JSON.parse(storedHistory) as DraftRevision[])
+            : [];
 
           const blogMetadata = storedBlogs
             ? (JSON.parse(storedBlogs) as BlogConnection[])
@@ -554,6 +674,7 @@ export default function Home() {
         setBlogs(restoredBlogs);
         setActiveBlogId(firstBlogId);
         setIsDark(restoredTheme);
+        setHistory(restoredHistory);
       } catch {
         if (cancelled) return;
         const firstDraft = createDraft();
@@ -571,40 +692,56 @@ export default function Home() {
     };
   }, []);
 
+  const persistWorkspace = useCallback(
+    async (historyOverride: DraftRevision[] = history) => {
+      const workspace: WorkspaceSnapshot = {
+        version: 2,
+        drafts,
+        activeId,
+        isDark,
+        blogs,
+        activeBlogId,
+        history: historyOverride,
+      };
+      if (window.arumaDesktop) {
+        await window.arumaDesktop.saveWorkspace(workspace);
+      } else {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(drafts));
+        localStorage.setItem(ACTIVE_KEY, activeId);
+        localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
+        localStorage.setItem(BLOGS_KEY, JSON.stringify(blogs));
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(historyOverride));
+        if (activeBlogId) {
+          localStorage.setItem(ACTIVE_BLOG_KEY, activeBlogId);
+        } else {
+          localStorage.removeItem(ACTIVE_BLOG_KEY);
+        }
+      }
+    }, [activeBlogId, activeId, blogs, drafts, history, isDark],
+  );
+
   useEffect(() => {
     if (!hydrated) return;
-    // This status mirrors the delayed workspace synchronization below.
     setSaveState("saving");
     const timer = window.setTimeout(async () => {
       try {
-        const workspace: WorkspaceSnapshot = {
-          version: 1,
-          drafts,
-          activeId,
-          isDark,
-          blogs,
-          activeBlogId,
-        };
-        if (window.arumaDesktop) {
-          await window.arumaDesktop.saveWorkspace(workspace);
-        } else {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(drafts));
-          localStorage.setItem(ACTIVE_KEY, activeId);
-          localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
-          localStorage.setItem(BLOGS_KEY, JSON.stringify(blogs));
-          if (activeBlogId) {
-            localStorage.setItem(ACTIVE_BLOG_KEY, activeBlogId);
-          } else {
-            localStorage.removeItem(ACTIVE_BLOG_KEY);
-          }
-        }
+        await persistWorkspace();
         setSaveState("saved");
       } catch {
         setToast("工作区保存失败，请先导出重要草稿");
       }
     }, 550);
     return () => window.clearTimeout(timer);
-  }, [activeBlogId, activeId, blogs, drafts, hydrated, isDark]);
+  }, [hydrated, persistWorkspace]);
+
+  useEffect(() => {
+    if (!hydrated || !active || active.updatedAt === 0) return;
+    const snapshot = structuredClone(active);
+    const timer = window.setTimeout(() => {
+      setHistory((current) => appendRevision(current, snapshot, "自动备份"));
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [active, hydrated]);
 
   useEffect(() => {
     if (!toast) return;
@@ -616,13 +753,22 @@ export default function Home() {
     const handleShortcut = (event: globalThis.KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        setSaveState("saved");
-        setToast("草稿已保存到本机");
+        const nextHistory = active
+          ? appendRevision(history, active, "手动保存")
+          : history;
+        setHistory(nextHistory);
+        setSaveState("saving");
+        void persistWorkspace(nextHistory)
+          .then(() => {
+            setSaveState("saved");
+            setToast("草稿与历史版本已保存到本机");
+          })
+          .catch(() => setToast("保存失败，请先导出重要草稿"));
       }
     };
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, []);
+  }, [active, history, persistWorkspace]);
 
   const filteredDrafts = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -811,11 +957,17 @@ export default function Home() {
           text: await file.text(),
           lastModified: file.lastModified,
           articlePath,
+          contentHash: "",
         });
       } catch {
         // Ignore non-article folders.
       }
     }
+    await Promise.all(
+      articles.map(async (article) => {
+        article.contentHash = await hashText(article.text);
+      }),
+    );
     articles.sort((a, b) => b.lastModified - a.lastModified);
     return {
       connection: {
@@ -845,6 +997,9 @@ export default function Home() {
       parsed.createdAt = article.lastModified;
       parsed.updatedAt = article.lastModified;
       parsed.articlePath = article.articlePath;
+      parsed.sourceHash = article.contentHash;
+      parsed.sourceModifiedAt = article.lastModified;
+      parsed.externalConflict = false;
       return parsed;
     });
 
@@ -861,8 +1016,25 @@ export default function Home() {
         (draft) =>
           draft.source !== "published" || draft.blogId !== connection.id,
       );
-      const synced = incoming.map((draft) => existing.get(draft.slug) ?? draft);
-      return [...otherDrafts, ...synced];
+      const incomingSlugs = new Set(incoming.map((draft) => draft.slug));
+      const missingOnDisk = [...existing.values()]
+        .filter((draft) => !incomingSlugs.has(draft.slug))
+        .map((draft) => ({ ...draft, externalConflict: true }));
+      const synced = incoming.map((draft) => {
+        const local = existing.get(draft.slug);
+        if (!local) return draft;
+        if (local.sourceHash && local.sourceHash !== draft.sourceHash) {
+          return { ...local, externalConflict: true };
+        }
+        return {
+          ...local,
+          sourceHash: draft.sourceHash,
+          sourceModifiedAt: draft.sourceModifiedAt,
+          articlePath: draft.articlePath,
+          externalConflict: false,
+        };
+      });
+      return [...otherDrafts, ...synced, ...missingOnDisk];
     });
   };
 
@@ -1046,7 +1218,54 @@ export default function Home() {
     }
   };
 
-  const publishToBlog = async () => {
+  const getBrowserBlogDirectory = async (connection: BlogConnection) => {
+    let directory = blogHandlesRef.current.get(connection.id);
+    if (!directory) {
+      directory = (await loadDirectoryHandle(connection.id)) ?? undefined;
+    }
+    if (!directory) throw new Error("需要重新授权目标博客目录");
+    const permission = directory.requestPermission
+      ? await directory.requestPermission({ mode: "readwrite" })
+      : "granted";
+    if (permission !== "granted") throw new Error("需要写入权限才能发布到博客");
+    blogHandlesRef.current.set(connection.id, directory);
+    return directory;
+  };
+
+  const inspectBrowserArticle = async (
+    directory: DirectoryHandleLike,
+    slug: string,
+    articlePath: string,
+  ): Promise<ArticleInspection> => {
+    try {
+      const fileHandle =
+        articlePath === `${slug}.md`
+          ? await directory.getFileHandle(articlePath)
+          : await (
+              await directory.getDirectoryHandle(slug)
+            ).getFileHandle("index.md");
+      const file = await fileHandle.getFile();
+      const text = await file.text();
+      return {
+        exists: true,
+        text,
+        hash: await hashText(text),
+        lastModified: file.lastModified,
+        target: articlePath,
+      };
+    } catch (error) {
+      if ((error as Error).name !== "NotFoundError") throw error;
+      return {
+        exists: false,
+        text: "",
+        hash: null,
+        lastModified: null,
+        target: articlePath,
+      };
+    }
+  };
+
+  const preparePublish = async () => {
     if (!active || !active.slug.trim()) {
       showMessage("请先填写文章 slug");
       return;
@@ -1057,98 +1276,223 @@ export default function Home() {
       showMessage("请先连接博客并为草稿选择目标博客");
       return;
     }
-    setIsPublishing(true);
+    setIsInspecting(true);
     try {
       const safeSlug = normalizeSlug(active.slug);
       if (!safeSlug) {
         showMessage("slug 只能包含文字、数字、连字符或下划线");
         return;
       }
-      const publishedArticle = {
+      const publishedArticle: Draft = {
         ...active,
-        draft: false,
         slug: safeSlug,
         blogId: connection.id,
       };
       const markdown = serializeDraft(publishedArticle);
       const articlePath = existingArticlePath(active.articlePath, safeSlug);
-
+      let inspection: ArticleInspection;
       if (window.arumaDesktop) {
-        let result = await window.arumaDesktop.publishArticle({
+        inspection = await window.arumaDesktop.inspectArticle({
           connection,
           slug: safeSlug,
-          markdown,
-          overwrite: false,
           articlePath,
         });
-        if (result.exists) {
-          if (!window.confirm(`“${articlePath}”已存在，确定覆盖吗？`)) {
-            return;
-          }
-          result = await window.arumaDesktop.publishArticle({
-            connection,
-            slug: safeSlug,
-            markdown,
-            overwrite: true,
-            articlePath,
-          });
-        }
-        if (!result.ok) return;
       } else {
-        let directory = blogHandlesRef.current.get(connection.id);
-        if (!directory) {
-          directory = (await loadDirectoryHandle(connection.id)) ?? undefined;
+        const directory = await getBrowserBlogDirectory(connection);
+        inspection = await inspectBrowserArticle(
+          directory,
+          safeSlug,
+          articlePath,
+        );
+      }
+      const sameSourceTarget = active.articlePath === articlePath;
+      const conflict =
+        sameSourceTarget &&
+        (active.externalConflict ||
+          (active.sourceHash !== null && active.sourceHash !== inspection.hash));
+      setPublishPreview({
+        connection,
+        article: publishedArticle,
+        markdown,
+        articlePath,
+        inspection,
+        conflict,
+        diff: buildLineDiff(inspection.text, markdown) as DiffLine[],
+      });
+    } catch (error) {
+      showMessage((error as Error).message || "无法读取目标文章");
+    } finally {
+      setIsInspecting(false);
+    }
+  };
+
+  const confirmPublish = async () => {
+    if (!publishPreview) return;
+    const preview = publishPreview;
+    setIsPublishing(true);
+    setHistory((current) =>
+      appendRevision(current, preview.article, "发布前"),
+    );
+    try {
+      let result: PublishResult;
+      if (window.arumaDesktop) {
+        result = await window.arumaDesktop.publishArticle({
+          connection: preview.connection,
+          slug: preview.article.slug,
+          markdown: preview.markdown,
+          overwrite: true,
+          articlePath: preview.articlePath,
+          expectedHash: preview.inspection.hash,
+        });
+      } else {
+        const directory = await getBrowserBlogDirectory(preview.connection);
+        const latest = await inspectBrowserArticle(
+          directory,
+          preview.article.slug,
+          preview.articlePath,
+        );
+        if (latest.hash !== preview.inspection.hash) {
+          result = {
+            ok: false,
+            exists: latest.exists,
+            target: preview.articlePath,
+            conflict: true,
+            inspection: latest,
+          };
+        } else {
+          const isDirectFile =
+            preview.articlePath === `${preview.article.slug}.md`;
+          const fileHandle = isDirectFile
+            ? await directory.getFileHandle(preview.articlePath, {
+                create: true,
+              })
+            : await (
+                await directory.getDirectoryHandle(preview.article.slug, {
+                  create: true,
+                })
+              ).getFileHandle("index.md", { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(preview.markdown);
+          await writable.close();
+          result = {
+            ok: true,
+            exists: latest.exists,
+            target: preview.articlePath,
+            hash: await hashText(preview.markdown),
+            lastModified: Date.now(),
+          };
         }
-        if (!directory) {
-          showMessage("需要重新授权目标博客目录");
-          setConnectionManagerOpen(true);
-          return;
-        }
-        const permission = directory.requestPermission
-          ? await directory.requestPermission({ mode: "readwrite" })
-          : "granted";
-        if (permission !== "granted") {
-          showMessage("需要写入权限才能发布到博客");
-          return;
-        }
-        const isDirectFile = articlePath === `${safeSlug}.md`;
-        try {
-          if (isDirectFile) {
-            await directory.getFileHandle(articlePath);
-          } else {
-            await directory.getDirectoryHandle(safeSlug);
-          }
-          if (!window.confirm(`“${articlePath}”已存在，确定覆盖吗？`)) {
-            return;
-          }
-        } catch {
-          // A new article is expected not to exist yet.
-        }
-        const fileHandle = isDirectFile
-          ? await directory.getFileHandle(articlePath, { create: true })
-          : await (
-              await directory.getDirectoryHandle(safeSlug, { create: true })
-            ).getFileHandle("index.md", { create: true });
-        const writable = await fileHandle.createWritable();
-        await writable.write(markdown);
-        await writable.close();
       }
 
-      setActiveBlogId(connection.id);
-      updateActive({
-        draft: false,
-        slug: safeSlug,
-        source: "published",
-        blogId: connection.id,
-        articlePath,
-      });
-      showMessage(`文章已写入 ${connection.name}，可以预览或提交了`);
+      if (result.conflict && result.inspection) {
+        const inspection = result.inspection;
+        setPublishPreview({
+          ...preview,
+          inspection,
+          conflict: true,
+          diff: buildLineDiff(inspection.text, preview.markdown) as DiffLine[],
+        });
+        showMessage("目标文件刚刚发生变化，差异已刷新，请重新确认");
+        return;
+      }
+      if (!result.ok) throw new Error("文章写入失败");
+
+      const nextFrontmatter = mergeArticleFrontmatter(
+        preview.article.frontmatter,
+        preview.article,
+      ) as Record<string, unknown>;
+      setActiveBlogId(preview.connection.id);
+      setDrafts((current) =>
+        current.map((draft) =>
+          draft.id === preview.article.id
+            ? {
+                ...preview.article,
+                source: "published",
+                articlePath: preview.articlePath,
+                frontmatter: nextFrontmatter,
+                sourceHash: result.hash ?? null,
+                sourceModifiedAt: result.lastModified ?? Date.now(),
+                externalConflict: false,
+                updatedAt: Date.now(),
+              }
+            : draft,
+        ),
+      );
+      setPublishPreview(null);
+      showMessage(
+        preview.article.draft
+          ? `草稿已写入 ${preview.connection.name}，博客将保持隐藏`
+          : `文章已写入 ${preview.connection.name}，可以预览或提交了`,
+      );
     } catch (error) {
       showMessage((error as Error).message || "写入失败，请检查博客连接");
     } finally {
       setIsPublishing(false);
     }
   };
+
+  const loadDiskVersion = () => {
+    if (!publishPreview?.inspection.exists) return;
+    const preview = publishPreview;
+    setHistory((current) =>
+      appendRevision(current, preview.article, "恢复前"),
+    );
+    const diskDraft = parseMarkdownDocument(
+      preview.inspection.text,
+      `${preview.article.slug}.md`,
+      preview.connection.id,
+    );
+    setDrafts((current) =>
+      current.map((draft) =>
+        draft.id === preview.article.id
+          ? {
+              ...diskDraft,
+              id: draft.id,
+              slug: preview.article.slug,
+              createdAt: draft.createdAt,
+              source: "published",
+              articlePath: preview.articlePath,
+              sourceHash: preview.inspection.hash,
+              sourceModifiedAt: preview.inspection.lastModified,
+              externalConflict: false,
+            }
+          : draft,
+      ),
+    );
+    setPublishPreview(null);
+    showMessage("已载入磁盘版本，恢复前内容保存在版本历史中");
+  };
+
+  const restoreRevision = (revision: DraftRevision) => {
+    if (!active) return;
+    setHistory((current) =>
+      appendRevision(current, active, "恢复前"),
+    );
+    const restored = normalizeDraft(structuredClone(revision.snapshot));
+    setDrafts((current) =>
+      current.map((draft) =>
+        draft.id === active.id
+          ? {
+              ...restored,
+              id: active.id,
+              updatedAt: Date.now(),
+            }
+          : draft,
+      ),
+    );
+    setHistoryOpen(false);
+    showMessage("历史版本已恢复，恢复前内容也已备份");
+  };
+
+  const activeRevisions = history.filter(
+    (revision) => revision.draftId === active?.id,
+  );
+  const publishChanges = publishPreview
+    ? diffSummary(publishPreview.diff)
+    : { added: 0, removed: 0 };
+  const visiblePublishDiff = publishPreview
+    ? compactDiff(publishPreview.diff)
+    : [];
 
   if (!active) return null;
 
@@ -1208,15 +1552,15 @@ export default function Home() {
           </button>
           <button
             className="publish-button"
-            onClick={publishToBlog}
-            disabled={isPublishing}
+            onClick={preparePublish}
+            disabled={isPublishing || isInspecting}
           >
-            <Sparkles size={16} />
-            {isPublishing
-              ? "正在写入…"
+            <GitCompare size={16} />
+            {isInspecting
+              ? "正在检查…"
               : draftBlog
-                ? `发布到 ${draftBlog.name}`
-                : "发布到博客"}
+                ? `检查并发布到 ${draftBlog.name}`
+                : "检查并发布"}
           </button>
           <button
             className="icon-button details-toggle"
@@ -1301,6 +1645,13 @@ export default function Home() {
                     {relativeTime(draft.updatedAt)}
                   </small>
                 </span>
+                {draft.externalConflict && (
+                  <ShieldAlert
+                    className="draft-conflict"
+                    size={15}
+                    aria-label="磁盘版本已变化"
+                  />
+                )}
                 {draft.draft && <i className="draft-dot" title="草稿" />}
               </button>
             ))}
@@ -1678,6 +2029,10 @@ export default function Home() {
             <div className="details-divider" />
 
             <div className="document-actions">
+              <button onClick={() => setHistoryOpen(true)}>
+                <History size={16} /> 版本历史
+                <small>{activeRevisions.length}</small>
+              </button>
               <button onClick={downloadMarkdown}>
                 <FileDown size={16} /> 导出 Markdown
               </button>
@@ -1699,6 +2054,217 @@ export default function Home() {
           </button>
         )}
       </div>
+
+      {publishPreview && (
+        <div className="modal-backdrop">
+          <section
+            className="publish-preview-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="publish-preview-title"
+          >
+            <header>
+              <div>
+                <span className="modal-kicker">SAFE PUBLISH</span>
+                <h2 id="publish-preview-title">发布前检查</h2>
+                <p>确认目标、草稿状态与文件差异后才会写入博客。</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setPublishPreview(null)}
+                aria-label="关闭发布前检查"
+                disabled={isPublishing}
+              >
+                <X size={19} />
+              </button>
+            </header>
+
+            <div className="publish-preview-body">
+              <div
+                className={`publish-safety-banner ${
+                  publishPreview.conflict ? "is-conflict" : ""
+                }`}
+              >
+                {publishPreview.conflict ? (
+                  <ShieldAlert size={20} />
+                ) : (
+                  <Check size={20} />
+                )}
+                <div>
+                  <strong>
+                    {publishPreview.conflict
+                      ? "检测到磁盘版本已在外部修改"
+                      : publishPreview.inspection.exists
+                        ? "目标文件已读取，可以安全覆盖"
+                        : "这是一个新文章文件"}
+                  </strong>
+                  <span>
+                    {publishPreview.conflict
+                      ? "请查看差异；也可以载入磁盘版本，当前内容会先进入历史。"
+                      : "写入时还会再次核验文件，防止确认后发生变化。"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="publish-facts">
+                <div>
+                  <span>目标博客</span>
+                  <strong>{publishPreview.connection.name}</strong>
+                </div>
+                <div>
+                  <span>文件路径</span>
+                  <strong>{publishPreview.articlePath}</strong>
+                </div>
+                <div>
+                  <span>博客状态</span>
+                  <strong>
+                    {publishPreview.article.draft ? "草稿 · 不公开" : "正式发布"}
+                  </strong>
+                </div>
+                <div>
+                  <span>内容变化</span>
+                  <strong>
+                    <i className="diff-added">+{publishChanges.added}</i>{" "}
+                    <i className="diff-removed">-{publishChanges.removed}</i>
+                  </strong>
+                </div>
+              </div>
+
+              <div className="diff-heading">
+                <span>磁盘版本</span>
+                <GitCompare size={15} />
+                <span>编辑器版本</span>
+              </div>
+              <div className="diff-view" role="region" aria-label="发布差异">
+                {visiblePublishDiff.map((line, index) => (
+                  <div
+                    className={`diff-line diff-${line.type}`}
+                    key={`${index}-${line.type}`}
+                  >
+                    <span>{line.oldLine ?? ""}</span>
+                    <span>{line.newLine ?? ""}</span>
+                    <b>{line.type === "add" ? "+" : line.type === "remove" ? "−" : " "}</b>
+                    <code>{line.text || " "}</code>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <footer>
+              <div>
+                {publishPreview.inspection.exists && (
+                  <button
+                    className="secondary-button"
+                    onClick={loadDiskVersion}
+                    disabled={isPublishing}
+                  >
+                    <RotateCcw size={15} /> 载入磁盘版本
+                  </button>
+                )}
+              </div>
+              <div>
+                <button
+                  className="secondary-button"
+                  onClick={() => setPublishPreview(null)}
+                  disabled={isPublishing}
+                >
+                  取消
+                </button>
+                <button
+                  className={`publish-button ${
+                    publishPreview.conflict ? "danger-publish" : ""
+                  }`}
+                  onClick={confirmPublish}
+                  disabled={isPublishing}
+                >
+                  <Sparkles size={16} />
+                  {isPublishing
+                    ? "正在安全写入…"
+                    : publishPreview.conflict
+                      ? "确认覆盖磁盘版本"
+                      : publishPreview.article.draft
+                        ? "写入为博客草稿"
+                        : "确认发布"}
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {historyOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setHistoryOpen(false);
+          }}
+        >
+          <section
+            className="history-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="history-title"
+          >
+            <header>
+              <div>
+                <span className="modal-kicker">LOCAL HISTORY</span>
+                <h2 id="history-title">版本历史</h2>
+                <p>每篇文章最多保留 20 个本地版本，恢复前会自动再备份一次。</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setHistoryOpen(false)}
+                aria-label="关闭版本历史"
+              >
+                <X size={19} />
+              </button>
+            </header>
+            <div className="history-list">
+              {activeRevisions.map((revision) => (
+                <article key={revision.id}>
+                  <span className="history-icon">
+                    <History size={17} />
+                  </span>
+                  <div>
+                    <strong>{revision.reason}</strong>
+                    <span>
+                      {new Intl.DateTimeFormat("zh-CN", {
+                        month: "2-digit",
+                        day: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit",
+                      }).format(revision.createdAt)}
+                    </span>
+                    <small>
+                      {wordCount(revision.snapshot.content)} 字 · {revision.snapshot.slug}
+                    </small>
+                  </div>
+                  <button onClick={() => restoreRevision(revision)}>
+                    <RotateCcw size={14} /> 恢复
+                  </button>
+                </article>
+              ))}
+              {!activeRevisions.length && (
+                <div className="history-empty">
+                  <History size={28} />
+                  <strong>还没有历史版本</strong>
+                  <span>停止编辑 15 秒或按 Ctrl / Cmd + S 后会自动创建。</span>
+                </div>
+              )}
+            </div>
+            <footer>
+              <span>历史仅保存在这台设备中，不会上传文章内容。</span>
+              <button
+                className="secondary-button"
+                onClick={() => setHistoryOpen(false)}
+              >
+                完成
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {connectionManagerOpen && (
         <div

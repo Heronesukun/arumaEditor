@@ -4,11 +4,19 @@ const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
-const WORKSPACE_VERSION = 1;
+const WORKSPACE_VERSION = 2;
 const trustedConnections = new Map();
 
 function workspaceFile() {
   return path.join(app.getPath("userData"), "workspace.json");
+}
+
+function previousWorkspaceFile() {
+  return path.join(app.getPath("userData"), "workspace.previous.json");
+}
+
+function workspaceBackupsDirectory() {
+  return path.join(app.getPath("userData"), "workspace-backups");
 }
 
 function emptyWorkspace() {
@@ -19,6 +27,7 @@ function emptyWorkspace() {
     isDark: false,
     blogs: [],
     activeBlogId: null,
+    history: [],
   };
 }
 
@@ -34,24 +43,86 @@ async function exists(target) {
 async function writeJsonAtomic(target, value) {
   await fs.mkdir(path.dirname(target), { recursive: true });
   const temporary = `${target}.${process.pid}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(value, null, 2), "utf8");
-  await fs.copyFile(temporary, target);
-  await fs.unlink(temporary).catch(() => {});
+  const handle = await fs.open(temporary, "w");
+  try {
+    await handle.writeFile(JSON.stringify(value, null, 2), "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+
+  const previous = previousWorkspaceFile();
+  const targetExists = await exists(target);
+  if (targetExists) {
+    await fs.unlink(previous).catch(() => {});
+    await fs.rename(target, previous);
+  }
+  try {
+    await fs.rename(temporary, target);
+  } catch (error) {
+    if (targetExists && (await exists(previous))) {
+      await fs.rename(previous, target).catch(() => {});
+    }
+    throw error;
+  }
+  if (targetExists) await archiveWorkspaceBackup(previous);
+}
+
+async function archiveWorkspaceBackup(previous) {
+  try {
+    const directory = workspaceBackupsDirectory();
+    await fs.mkdir(directory, { recursive: true });
+    const backups = (await fs.readdir(directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .sort((a, b) => b.name.localeCompare(a.name));
+    const newest = backups[0]
+      ? await fs.stat(path.join(directory, backups[0].name))
+      : null;
+    if (!newest || Date.now() - newest.mtimeMs >= 5 * 60 * 1000) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      await fs.copyFile(previous, path.join(directory, `workspace-${stamp}.json`));
+      for (const backup of backups.slice(11)) {
+        await fs.unlink(path.join(directory, backup.name)).catch(() => {});
+      }
+    }
+  } catch {
+    // A failed archival backup must not interrupt normal autosave.
+  }
+}
+
+async function parseWorkspaceFile(target) {
+  const parsed = JSON.parse(await fs.readFile(target, "utf8"));
+  return {
+    ...emptyWorkspace(),
+    ...parsed,
+    version: WORKSPACE_VERSION,
+    drafts: Array.isArray(parsed.drafts) ? parsed.drafts : [],
+    blogs: Array.isArray(parsed.blogs) ? parsed.blogs : [],
+    history: Array.isArray(parsed.history) ? parsed.history : [],
+  };
 }
 
 async function readWorkspace() {
+  const candidates = [workspaceFile(), previousWorkspaceFile()];
   try {
-    const parsed = JSON.parse(await fs.readFile(workspaceFile(), "utf8"));
-    return {
-      ...emptyWorkspace(),
-      ...parsed,
-      version: WORKSPACE_VERSION,
-      drafts: Array.isArray(parsed.drafts) ? parsed.drafts : [],
-      blogs: Array.isArray(parsed.blogs) ? parsed.blogs : [],
-    };
+    const backups = await fs.readdir(workspaceBackupsDirectory());
+    candidates.push(
+      ...backups
+        .filter((name) => name.endsWith(".json"))
+        .sort((a, b) => b.localeCompare(a))
+        .map((name) => path.join(workspaceBackupsDirectory(), name)),
+    );
   } catch {
-    return emptyWorkspace();
+    // There may be no archived backups on a first run.
   }
+  for (const candidate of candidates) {
+    try {
+      return await parseWorkspaceFile(candidate);
+    } catch {
+      // Continue with the next recovery candidate.
+    }
+  }
+  return emptyWorkspace();
 }
 
 function sanitizeWorkspace(input) {
@@ -64,6 +135,7 @@ function sanitizeWorkspace(input) {
     blogs: Array.isArray(source.blogs) ? source.blogs : [],
     activeBlogId:
       typeof source.activeBlogId === "string" ? source.activeBlogId : null,
+    history: Array.isArray(source.history) ? source.history.slice(0, 120) : [],
   };
 }
 
@@ -189,6 +261,7 @@ async function scanBlog(connection) {
         text,
         lastModified: stat.mtimeMs,
         articlePath: relativeArticlePath,
+        contentHash: crypto.createHash("sha256").update(text).digest("hex"),
       });
     } catch {
       // A folder without index.md is not an article and can be ignored.
@@ -235,17 +308,7 @@ async function addBlog(window) {
   return scanned;
 }
 
-async function publishArticle(request) {
-  const { connection, slug, markdown, overwrite, articlePath } = request ?? {};
-  const validation = await validateConnection(connection);
-  if (validation.status !== "connected") {
-    throw new Error(validation.message);
-  }
-  if (typeof slug !== "string" || !/^[a-z0-9\u4e00-\u9fff_-]+$/u.test(slug)) {
-    throw new Error("文章 slug 不合法");
-  }
-  if (typeof markdown !== "string") throw new Error("文章内容为空");
-
+function resolveArticleTarget(connection, slug, articlePath) {
   const postRoot = path.resolve(connection.postPath);
   const normalizedArticlePath = String(articlePath ?? "").replace(/\\/g, "/");
   const allowedPaths = new Set([`${slug}.md`, `${slug}/index.md`]);
@@ -257,21 +320,188 @@ async function publishArticle(request) {
   if (relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) {
     throw new Error("文章路径超出博客目录");
   }
+  return { target, targetRelative };
+}
 
-  const alreadyExists = await exists(target);
-  if (alreadyExists && !overwrite) {
+async function inspectArticle(request) {
+  const { connection, slug, articlePath } = request ?? {};
+  const validation = await validateConnection(connection);
+  if (validation.status !== "connected") {
+    throw new Error(validation.message);
+  }
+  if (typeof slug !== "string" || !/^[a-z0-9\u4e00-\u9fff_-]+$/u.test(slug)) {
+    throw new Error("文章 slug 不合法");
+  }
+  const { target, targetRelative } = resolveArticleTarget(
+    connection,
+    slug,
+    articlePath,
+  );
+  try {
+    const [text, stat] = await Promise.all([
+      fs.readFile(target, "utf8"),
+      fs.stat(target),
+    ]);
+    return {
+      exists: true,
+      text,
+      hash: crypto.createHash("sha256").update(text).digest("hex"),
+      lastModified: stat.mtimeMs,
+      target: targetRelative,
+    };
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    return {
+      exists: false,
+      text: "",
+      hash: null,
+      lastModified: null,
+      target: targetRelative,
+    };
+  }
+}
+
+async function backupArticle(connection, target, targetRelative) {
+  try {
+    const safeName = targetRelative.replace(/[\\/:*?"<>|]/g, "_");
+    const directory = path.join(
+      app.getPath("userData"),
+      "article-backups",
+      connection.id,
+    );
+    await fs.mkdir(directory, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    await fs.copyFile(target, path.join(directory, `${stamp}-${safeName}`));
+    const backups = (await fs.readdir(directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .sort((a, b) => b.name.localeCompare(a.name));
+    for (const backup of backups.slice(39)) {
+      await fs.unlink(path.join(directory, backup.name)).catch(() => {});
+    }
+  } catch {
+    // Version history remains available if an auxiliary file backup fails.
+  }
+}
+
+async function publishArticle(request) {
+  const {
+    connection,
+    slug,
+    markdown,
+    overwrite,
+    articlePath,
+    expectedHash,
+  } = request ?? {};
+  if (typeof markdown !== "string") throw new Error("文章内容为空");
+  const inspection = await inspectArticle({ connection, slug, articlePath });
+  const { target, targetRelative } = resolveArticleTarget(
+    connection,
+    slug,
+    articlePath,
+  );
+
+  if (inspection.hash !== (expectedHash ?? null)) {
+    return {
+      ok: false,
+      exists: inspection.exists,
+      target: targetRelative,
+      conflict: true,
+      inspection,
+    };
+  }
+
+  if (inspection.exists && !overwrite) {
     return { ok: false, exists: true, target };
   }
 
   await fs.mkdir(path.dirname(target), { recursive: true });
+  if (inspection.exists) {
+    await backupArticle(connection, target, targetRelative);
+  }
   const temporary = path.join(
     path.dirname(target),
     `.${path.basename(target)}.${process.pid}.tmp`,
   );
-  await fs.writeFile(temporary, markdown, "utf8");
-  await fs.copyFile(temporary, target);
-  await fs.unlink(temporary).catch(() => {});
-  return { ok: true, exists: alreadyExists, target };
+  const handle = await fs.open(temporary, "w");
+  try {
+    await handle.writeFile(markdown, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const previous = `${target}.aruma-editor-previous`;
+  if (inspection.exists) {
+    await fs.unlink(previous).catch(() => {});
+    await fs.rename(target, previous);
+  }
+  try {
+    await fs.rename(temporary, target);
+  } catch (error) {
+    if (inspection.exists && (await exists(previous))) {
+      await fs.rename(previous, target).catch(() => {});
+    }
+    throw error;
+  }
+  await fs.unlink(previous).catch(() => {});
+  const stat = await fs.stat(target);
+  return {
+    ok: true,
+    exists: inspection.exists,
+    target: targetRelative,
+    hash: crypto.createHash("sha256").update(markdown).digest("hex"),
+    lastModified: stat.mtimeMs,
+  };
+}
+
+async function runReliabilitySmoke() {
+  const temporaryRoot = await fs.mkdtemp(
+    path.join(app.getPath("temp"), "aruma-editor-reliability-"),
+  );
+  try {
+    const postPath = path.join(temporaryRoot, "src", "content", "post");
+    await fs.mkdir(postPath, { recursive: true });
+    const connection = {
+      id: "reliability-smoke",
+      name: "Reliability smoke",
+      rootPath: temporaryRoot,
+      postPath,
+      status: "connected",
+      message: "目录可读写",
+      articleCount: 0,
+      lastConnectedAt: Date.now(),
+      lastSyncedAt: Date.now(),
+      blogType: "aruma",
+    };
+    const initial = await inspectArticle({
+      connection,
+      slug: "smoke",
+      articlePath: "smoke/index.md",
+    });
+    const firstWrite = await publishArticle({
+      connection,
+      slug: "smoke",
+      articlePath: "smoke/index.md",
+      markdown: "---\ntitle: smoke\ndraft: true\n---\n\nfirst\n",
+      overwrite: true,
+      expectedHash: initial.hash,
+    });
+    await fs.writeFile(
+      path.join(postPath, "smoke", "index.md"),
+      "---\ntitle: external\n---\n\nchanged elsewhere\n",
+      "utf8",
+    );
+    const conflict = await publishArticle({
+      connection,
+      slug: "smoke",
+      articlePath: "smoke/index.md",
+      markdown: "---\ntitle: stale\n---\n\nstale editor\n",
+      overwrite: true,
+      expectedHash: firstWrite.hash,
+    });
+    return firstWrite.ok && conflict.conflict === true;
+  } finally {
+    await fs.rm(temporaryRoot, { recursive: true, force: true });
+  }
 }
 
 function registerIpc(mainWindow) {
@@ -304,6 +534,12 @@ function registerIpc(mainWindow) {
     rememberConnection(scanned.connection);
     return scanned;
   });
+  ipcMain.handle("blog:inspect", (_event, request) =>
+    inspectArticle({
+      ...request,
+      connection: trustedConnection(request?.connection),
+    }),
+  );
   ipcMain.handle("blog:publish", (_event, request) =>
     publishArticle({
       ...request,
@@ -350,6 +586,7 @@ function createWindow() {
         const smokeBlogPath = process.env.ARUMA_EDITOR_SMOKE_BLOG;
         let blogArticleCount = null;
         let blogType = null;
+        const reliability = await runReliabilitySmoke();
         if (smokeBlogPath) {
           const resolved = await resolveBlogDirectory(smokeBlogPath);
           const scanned = await scanBlog({
@@ -365,12 +602,13 @@ function createWindow() {
           blogArticleCount = scanned.articles.length;
           blogType = resolved.blogType;
         }
-        const result = { ...renderer, blogArticleCount, blogType };
+        const result = { ...renderer, blogArticleCount, blogType, reliability };
         console.log(`DESKTOP_SMOKE ${JSON.stringify(result)}`);
         app.exit(
           result.hasRoot &&
             result.hasEditor &&
             result.hasTitle &&
+            result.reliability &&
             (!smokeBlogPath || result.blogArticleCount > 0)
             ? 0
             : 1,
