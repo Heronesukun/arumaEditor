@@ -46,6 +46,7 @@ import { marked } from "marked";
 import {
   appendDraftRevision,
   buildLineDiff,
+  collectBlogTags,
   hashText,
   mergeArticleFrontmatter,
   parseMarkdownSource,
@@ -66,6 +67,25 @@ type ArticleSource = "draft" | "imported" | "published";
 type BlogType = "aruma" | "mizuki" | "compatible";
 type RevisionReason = "自动备份" | "手动保存" | "发布前" | "恢复前";
 type DiffType = "equal" | "add" | "remove";
+
+type MarkdownBlock = {
+  key: string;
+  start: number;
+  end: number;
+  source: string;
+  html: string;
+};
+
+type VisualBlockEdit = {
+  draftId: string;
+  start: number;
+  value: string;
+};
+
+type TagPickerState = {
+  draftId: string;
+  selected: string[];
+};
 
 function escapeHtml(value: string) {
   return value.replace(
@@ -108,6 +128,42 @@ previewRenderer.image = ({ href, title, text }) => {
     : "";
   return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text)}"${titleAttribute}>`;
 };
+
+function renderMarkdown(value: string) {
+  return marked.parse(value, {
+    breaks: true,
+    gfm: true,
+    renderer: previewRenderer,
+  }) as string;
+}
+
+function splitMarkdownBlocks(value: string, offset = 0): MarkdownBlock[] {
+  let cursor = 0;
+  return marked
+    .lexer(value, { breaks: true, gfm: true })
+    .flatMap((token, index) => {
+      const raw = String(token.raw ?? "");
+      if (!raw) return [];
+      const tokenStart = value.indexOf(raw, cursor);
+      if (tokenStart < 0) return [];
+      cursor = tokenStart + raw.length;
+      if (token.type === "space" || !raw.trim()) return [];
+
+      const trailingLines = raw.match(/(?:\r?\n)+$/)?.[0].length ?? 0;
+      const source = raw.slice(0, raw.length - trailingLines);
+      if (!source.trim()) return [];
+      const start = offset + tokenStart;
+      return [
+        {
+          key: `${start}-${token.type}-${index}`,
+          start,
+          end: start + source.length,
+          source,
+          html: renderMarkdown(source),
+        },
+      ];
+    });
+}
 
 type Draft = {
   id: string;
@@ -554,6 +610,9 @@ export default function Home() {
   const [viewMode, setViewMode] = useState<ViewMode>("split");
   const [search, setSearch] = useState("");
   const [tagInput, setTagInput] = useState("");
+  const [tagSearch, setTagSearch] = useState("");
+  const [tagPicker, setTagPicker] = useState<TagPickerState | null>(null);
+  const [visualBlock, setVisualBlock] = useState<VisualBlockEdit | null>(null);
   const [isDark, setIsDark] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(true);
@@ -574,6 +633,7 @@ export default function Home() {
   );
   const [isInspecting, setIsInspecting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const visualTextareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const blogHandlesRef = useRef(new Map<string, DirectoryHandleLike>());
 
@@ -781,13 +841,24 @@ export default function Home() {
     );
   }, [drafts, search]);
 
-  const previewHtml = useMemo(() => {
-    return marked.parse(active?.content ?? "", {
-      breaks: true,
-      gfm: true,
-      renderer: previewRenderer,
-    }) as string;
-  }, [active?.content]);
+  const tagBlogId = active?.blogId ?? activeBlogId;
+  const tagBlog = blogs.find((blog) => blog.id === tagBlogId) ?? null;
+  const blogTags = useMemo(
+    () => collectBlogTags(drafts, tagBlogId),
+    [drafts, tagBlogId],
+  );
+  const filteredBlogTags = useMemo(() => {
+    const query = tagSearch.trim().toLocaleLowerCase();
+    return blogTags.filter((tag: { name: string; count: number }) =>
+      query ? tag.name.toLocaleLowerCase().includes(query) : true,
+    );
+  }, [blogTags, tagSearch]);
+  const activeVisualBlock =
+    visualBlock?.draftId === active?.id ? visualBlock : null;
+  const previewBlocks = useMemo(
+    () => splitMarkdownBlocks(active?.content ?? ""),
+    [active?.content],
+  );
 
   const updateActive = useCallback(
     (patch: Partial<Draft>) => {
@@ -840,8 +911,42 @@ export default function Home() {
     after = "",
     placeholder = "在这里输入文字",
   ) => {
+    if (!active) return;
+    const visualTextarea = visualTextareaRef.current;
+    if (
+      activeVisualBlock &&
+      visualTextarea &&
+      document.activeElement === visualTextarea
+    ) {
+      const start = visualTextarea.selectionStart;
+      const end = visualTextarea.selectionEnd;
+      const selection = activeVisualBlock.value.slice(start, end) || placeholder;
+      const nextBlock =
+        activeVisualBlock.value.slice(0, start) +
+        before +
+        selection +
+        after +
+        activeVisualBlock.value.slice(end);
+      const blockEnd = activeVisualBlock.start + activeVisualBlock.value.length;
+      updateActive({
+        content:
+          active.content.slice(0, activeVisualBlock.start) +
+          nextBlock +
+          active.content.slice(blockEnd),
+      });
+      setVisualBlock({ ...activeVisualBlock, value: nextBlock });
+      window.requestAnimationFrame(() => {
+        visualTextarea.focus();
+        visualTextarea.setSelectionRange(
+          start + before.length,
+          start + before.length + selection.length,
+        );
+      });
+      return;
+    }
+
     const textarea = textareaRef.current;
-    if (!textarea || !active) return;
+    if (!textarea) return;
     const start = textarea.selectionStart;
     const end = textarea.selectionEnd;
     const selection = active.content.slice(start, end) || placeholder;
@@ -869,10 +974,92 @@ export default function Home() {
   };
 
   const addTag = () => {
-    const value = tagInput.trim().replace(/^#/, "");
-    if (!value || active.tags.includes(value)) return;
-    updateActive({ tags: [...active.tags, value] });
+    const values = tagInput
+      .split(/[,，\n]+/)
+      .map((value) => value.trim().replace(/^#+/, "").trim())
+      .filter(Boolean);
+    if (!values.length) return;
+    updateActive({ tags: [...new Set([...active.tags, ...values])] });
     setTagInput("");
+  };
+
+  const openTagPicker = () => {
+    setTagSearch("");
+    setTagPicker({ draftId: active.id, selected: [] });
+  };
+
+  const toggleSuggestedTag = (name: string) => {
+    setTagPicker((current) => {
+      if (!current || current.draftId !== active.id) return current;
+      return {
+        ...current,
+        selected: current.selected.includes(name)
+          ? current.selected.filter((tag) => tag !== name)
+          : [...current.selected, name],
+      };
+    });
+  };
+
+  const selectVisibleTags = () => {
+    const selectable = filteredBlogTags
+      .map((tag: { name: string }) => tag.name)
+      .filter((tag: string) => !active.tags.includes(tag));
+    setTagPicker((current) =>
+      current && current.draftId === active.id
+        ? { ...current, selected: [...new Set([...current.selected, ...selectable])] }
+        : current,
+    );
+  };
+
+  const applySelectedTags = () => {
+    if (!tagPicker || tagPicker.draftId !== active.id) return;
+    const selected = tagPicker.selected.filter(
+      (tag) => !active.tags.includes(tag),
+    );
+    if (!selected.length) return;
+    updateActive({ tags: [...active.tags, ...selected] });
+    setTagPicker(null);
+    showMessage(`已添加 ${selected.length} 个标签`);
+  };
+
+  const startVisualEdit = (block: MarkdownBlock) => {
+    setVisualBlock({
+      draftId: active.id,
+      start: block.start,
+      value: block.source,
+    });
+    window.requestAnimationFrame(() => {
+      visualTextareaRef.current?.focus();
+    });
+  };
+
+  const updateVisualBlock = (value: string) => {
+    if (!activeVisualBlock) return;
+    const blockEnd = activeVisualBlock.start + activeVisualBlock.value.length;
+    updateActive({
+      content:
+        active.content.slice(0, activeVisualBlock.start) +
+        value +
+        active.content.slice(blockEnd),
+    });
+    setVisualBlock({ ...activeVisualBlock, value });
+  };
+
+  const handleVisualEditorKeyDown = (
+    event: KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      insertMarkdown("  ", "", "");
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      setVisualBlock(null);
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setVisualBlock(null);
+    }
   };
 
   const importFile = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1727,7 +1914,10 @@ export default function Home() {
             </div>
 
             <div className="editor-toolbar" role="toolbar" aria-label="Markdown 工具栏">
-              <div className="format-actions">
+              <div
+                className="format-actions"
+                onMouseDown={(event) => event.preventDefault()}
+              >
                 <button onClick={() => insertMarkdown("## ", "", "小标题")} title="二级标题">
                   <Heading2 size={17} />
                 </button>
@@ -1778,10 +1968,10 @@ export default function Home() {
                 <button
                   className={viewMode === "preview" ? "active" : ""}
                   onClick={() => setViewMode("preview")}
-                  title="仅预览"
+                  title="所见即所得编辑"
                 >
                   <Eye size={15} />
-                  <span>预览</span>
+                  <span>所见即所得</span>
                 </button>
               </div>
             </div>
@@ -1813,13 +2003,116 @@ export default function Home() {
               {viewMode !== "write" && (
                 <div className="preview-pane">
                   <div className="pane-label">
-                    <span>ARUMA PREVIEW</span>
-                    <small>实时渲染</small>
+                    <span>VISUAL EDITOR</span>
+                    <small>点击正文直接编辑 · Ctrl / ⌘ + Enter 完成</small>
                   </div>
-                  <article
-                    className="markdown-body"
-                    dangerouslySetInnerHTML={{ __html: previewHtml }}
-                  />
+                  <article className="markdown-body visual-markdown-editor">
+                    {activeVisualBlock ? (
+                      <>
+                        {splitMarkdownBlocks(
+                          active.content.slice(0, activeVisualBlock.start),
+                        ).map((block) => (
+                          <div
+                            key={block.key}
+                            className="rendered-markdown-block"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => startVisualEdit(block)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                startVisualEdit(block);
+                              }
+                            }}
+                            dangerouslySetInnerHTML={{ __html: block.html }}
+                          />
+                        ))}
+                        <div className="visual-block-editor">
+                          <textarea
+                            ref={visualTextareaRef}
+                            value={activeVisualBlock.value}
+                            onChange={(event) =>
+                              updateVisualBlock(event.target.value)
+                            }
+                            onKeyDown={handleVisualEditorKeyDown}
+                            onSelect={(event) =>
+                              setCursorLine(
+                                active.content
+                                  .slice(
+                                    0,
+                                    activeVisualBlock.start +
+                                      event.currentTarget.selectionStart,
+                                  )
+                                  .split("\n").length,
+                              )
+                            }
+                            onBlur={() => setVisualBlock(null)}
+                            rows={Math.max(
+                              2,
+                              activeVisualBlock.value.split("\n").length,
+                            )}
+                            spellCheck={false}
+                            aria-label="正在编辑的 Markdown 内容块"
+                          />
+                          <small>Markdown 语法 · Esc 或 Ctrl / ⌘ + Enter 完成</small>
+                        </div>
+                        {splitMarkdownBlocks(
+                          active.content.slice(
+                            activeVisualBlock.start +
+                              activeVisualBlock.value.length,
+                          ),
+                          activeVisualBlock.start + activeVisualBlock.value.length,
+                        ).map((block) => (
+                          <div
+                            key={block.key}
+                            className="rendered-markdown-block"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => startVisualEdit(block)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                startVisualEdit(block);
+                              }
+                            }}
+                            dangerouslySetInnerHTML={{ __html: block.html }}
+                          />
+                        ))}
+                      </>
+                    ) : previewBlocks.length ? (
+                      previewBlocks.map((block) => (
+                        <div
+                          key={block.key}
+                          className="rendered-markdown-block"
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => startVisualEdit(block)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              startVisualEdit(block);
+                            }
+                          }}
+                          dangerouslySetInnerHTML={{ __html: block.html }}
+                        />
+                      ))
+                    ) : (
+                      <button
+                        className="visual-editor-empty"
+                        onClick={() =>
+                          startVisualEdit({
+                            key: "empty",
+                            start: 0,
+                            end: 0,
+                            source: "",
+                            html: "",
+                          })
+                        }
+                      >
+                        点击这里开始写作…
+                      </button>
+                    )}
+                  </article>
                 </div>
               )}
             </div>
@@ -1986,15 +2279,92 @@ export default function Home() {
                   value={tagInput}
                   onChange={(event) => setTagInput(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === ",") {
+                    if (event.key === "Enter") {
                       event.preventDefault();
                       addTag();
                     }
                   }}
                   onBlur={addTag}
-                  placeholder="添加标签后回车"
+                  placeholder="可粘贴多个，以逗号分隔"
                 />
               </label>
+              {tagBlog && (
+                <button className="tag-picker-trigger" onClick={openTagPicker}>
+                  <Tag size={14} />
+                  <span>
+                    <strong>从 {tagBlog.name} 选择</strong>
+                    <small>{blogTags.length} 个已有标签</small>
+                  </span>
+                  <ChevronDown size={14} />
+                </button>
+              )}
+              {tagPicker?.draftId === active.id && (
+                <div className="tag-picker-popover">
+                  <label className="tag-picker-search">
+                    <Search size={13} />
+                    <input
+                      value={tagSearch}
+                      onChange={(event) => setTagSearch(event.target.value)}
+                      placeholder="搜索已有标签"
+                      autoFocus
+                    />
+                    {tagSearch && (
+                      <button
+                        onClick={() => setTagSearch("")}
+                        aria-label="清空标签搜索"
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </label>
+                  <div className="tag-picker-actions">
+                    <button onClick={selectVisibleTags}>选择筛选结果</button>
+                    <small>{tagPicker.selected.length} 个待添加</small>
+                  </div>
+                  <div className="tag-suggestions">
+                    {filteredBlogTags.map(
+                      (tag: { name: string; count: number }) => {
+                        const isAdded = active.tags.includes(tag.name);
+                        const isSelected = tagPicker.selected.includes(tag.name);
+                        return (
+                          <label
+                            key={tag.name}
+                            className={isAdded ? "is-added" : ""}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isAdded || isSelected}
+                              disabled={isAdded}
+                              onChange={() => toggleSuggestedTag(tag.name)}
+                            />
+                            <span>{tag.name}</span>
+                            <small>
+                              {isAdded ? "已添加" : `${tag.count} 篇文章`}
+                            </small>
+                          </label>
+                        );
+                      },
+                    )}
+                    {!filteredBlogTags.length && (
+                      <div className="tag-picker-empty">
+                        {blogTags.length
+                          ? "没有匹配的标签"
+                          : "博客文章中还没有可复用的标签"}
+                      </div>
+                    )}
+                  </div>
+                  <div className="tag-picker-footer">
+                    <button onClick={() => setTagPicker(null)}>取消</button>
+                    <button
+                      className="primary"
+                      onClick={applySelectedTags}
+                      disabled={!tagPicker.selected.length}
+                    >
+                      添加 {tagPicker.selected.length} 个标签
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="details-divider" />
