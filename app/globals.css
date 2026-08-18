@@ -848,6 +848,79 @@ textarea:focus-visible {
   margin-top: 0;
 }
 
+.rendered-markdown-block {
+  margin: -5px -9px;
+  padding: 5px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: text;
+  outline: none;
+  transition: 0.16s ease;
+}
+
+.rendered-markdown-block:hover,
+.rendered-markdown-block:focus-visible {
+  background: color-mix(in srgb, var(--hover) 66%, transparent);
+  border-color: rgba(255, 64, 129, 0.13);
+}
+
+.rendered-markdown-block > :first-child {
+  margin-top: 0;
+}
+
+.rendered-markdown-block > :last-child {
+  margin-bottom: 0;
+}
+
+.rendered-markdown-block a {
+  pointer-events: none;
+}
+
+.visual-block-editor {
+  position: relative;
+  margin: 8px -10px;
+  padding: 9px 10px 27px;
+  background: color-mix(in srgb, var(--field) 82%, transparent);
+  border: 1px solid rgba(255, 64, 129, 0.32);
+  border-radius: 8px;
+  box-shadow: 0 0 0 3px rgba(255, 64, 129, 0.06);
+}
+
+.visual-block-editor textarea {
+  width: 100%;
+  min-height: 58px;
+  resize: vertical;
+  overflow: hidden;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  outline: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.8;
+  tab-size: 2;
+}
+
+.visual-block-editor small {
+  position: absolute;
+  right: 10px;
+  bottom: 7px;
+  color: var(--faint);
+  font-family: var(--sans);
+  font-size: 8px;
+}
+
+.visual-editor-empty {
+  width: 100%;
+  min-height: 160px;
+  color: var(--faint);
+  text-align: left;
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  cursor: text;
+}
+
 .markdown-body h1,
 .markdown-body h2,
 .markdown-body h3,
@@ -1239,6 +1312,7 @@ textarea:focus-visible {
 }
 
 .tag-section {
+  position: relative;
   padding: 14px 17px 15px;
 }
 
@@ -1299,6 +1373,188 @@ textarea:focus-visible {
   background: none;
   border: 0;
   outline: none;
+}
+
+.tag-picker-trigger {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  padding: 6px 8px;
+  color: var(--muted);
+  text-align: left;
+  background: transparent;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tag-picker-trigger:hover {
+  color: var(--pink);
+  background: var(--hover);
+  border-color: rgba(255, 64, 129, 0.28);
+}
+
+.tag-picker-trigger > span {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tag-picker-trigger strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-picker-trigger small {
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.tag-picker-popover {
+  margin-top: 7px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  box-shadow: var(--shadow);
+}
+
+.tag-picker-search {
+  height: 33px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--faint);
+  background: var(--field);
+  border-bottom: 1px solid var(--line);
+}
+
+.tag-picker-search input {
+  min-width: 0;
+  flex: 1;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  outline: none;
+  font-size: 9px;
+}
+
+.tag-picker-search button {
+  display: grid;
+  place-items: center;
+  padding: 2px;
+  color: var(--faint);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.tag-picker-actions,
+.tag-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  padding: 7px 8px;
+}
+
+.tag-picker-actions button,
+.tag-picker-footer button {
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  font-size: 8px;
+  cursor: pointer;
+}
+
+.tag-picker-actions button:hover {
+  color: var(--pink);
+}
+
+.tag-picker-actions small {
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.tag-suggestions {
+  max-height: 174px;
+  padding: 2px 6px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.tag-suggestions label {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 3px;
+  color: var(--ink);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.tag-suggestions label + label {
+  border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+}
+
+.tag-suggestions label.is-added {
+  color: var(--faint);
+  cursor: default;
+}
+
+.tag-suggestions input {
+  accent-color: var(--pink);
+}
+
+.tag-suggestions span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-suggestions small {
+  color: var(--faint);
+  font-size: 7px;
+}
+
+.tag-picker-empty {
+  padding: 18px 8px;
+  color: var(--faint);
+  text-align: center;
+  font-size: 8px;
+}
+
+.tag-picker-footer {
+  justify-content: flex-end;
+}
+
+.tag-picker-footer button {
+  min-height: 27px;
+  padding: 0 9px;
+  border-radius: 5px;
+}
+
+.tag-picker-footer button.primary {
+  color: white;
+  background: var(--pink);
+}
+
+.tag-picker-footer button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .switch-list {

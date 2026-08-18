@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   appendDraftRevision,
   buildLineDiff,
+  collectBlogTags,
   hashText,
   parseMarkdownSource,
   serializeArticleSource,
@@ -114,4 +115,19 @@ test("deduplicates and caps local draft history", () => {
   }
   assert.equal(history.length, 3);
   assert.equal(history[0].snapshot.content, "version 5");
+});
+
+test("collects reusable tags from the selected blog", () => {
+  const drafts = [
+    { blogId: "blog-a", tags: ["随笔", "前端", "前端"] },
+    { blogId: "blog-a", tags: ["#随笔", "生活"] },
+    { blogId: "blog-b", tags: ["不应出现"] },
+  ];
+
+  assert.deepEqual(collectBlogTags(drafts, "blog-a"), [
+    { name: "随笔", count: 2 },
+    { name: "前端", count: 1 },
+    { name: "生活", count: 1 },
+  ]);
+  assert.deepEqual(collectBlogTags(drafts, null), []);
 });

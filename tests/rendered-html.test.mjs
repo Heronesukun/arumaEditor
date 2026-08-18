@@ -38,6 +38,9 @@ test("server-renders the Aruma and Mizuki writing workspace", async () => {
   assert.match(html, /管理博客连接/);
   assert.match(html, /版本历史/);
   assert.match(html, /Frontmatter/);
+  assert.match(html, /所见即所得/);
+  assert.match(html, /点击正文直接编辑/);
+  assert.match(html, /可粘贴多个/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
