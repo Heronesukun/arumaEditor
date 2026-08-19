@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveEditorShortcut } from "../lib/editor-commands.mjs";
+import {
+  appendTrailingEditorLine,
+  resolveEditorShortcut,
+} from "../lib/editor-commands.mjs";
 
 function shortcut(overrides) {
   return {
@@ -27,6 +30,7 @@ test("maps heading and inline formatting shortcuts", () => {
   );
   assert.equal(resolveEditorShortcut(shortcut({ key: "i" })), "italic");
   assert.equal(resolveEditorShortcut(shortcut({ key: "k" })), "link");
+  assert.equal(resolveEditorShortcut(shortcut({ key: "z" })), "undo");
 });
 
 test("maps list, quote, and strikethrough shortcuts", () => {
@@ -60,4 +64,10 @@ test("leaves unmodified and alt-modified keys to the platform", () => {
   assert.equal(resolveEditorShortcut(shortcut({ ctrlKey: false, key: "b" })), null);
   assert.equal(resolveEditorShortcut(shortcut({ altKey: true, key: "b" })), null);
   assert.equal(resolveEditorShortcut(shortcut({ key: "s" })), null);
+});
+
+test("adds no more than two trailing editor lines", () => {
+  assert.equal(appendTrailingEditorLine("正文"), "正文\n");
+  assert.equal(appendTrailingEditorLine("正文\n"), "正文\n\n");
+  assert.equal(appendTrailingEditorLine("正文\n\n"), null);
 });

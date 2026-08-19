@@ -41,6 +41,8 @@ test("server-renders the Aruma and Mizuki writing workspace", async () => {
   assert.match(html, /即时编辑/);
   assert.match(html, /连续编辑/);
   assert.match(html, /常用编辑快捷键/);
+  assert.match(html, /撤回正文修改/);
+  assert.match(html, /文末 ↓ 最多补两行/);
   assert.match(html, /可粘贴多个/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
@@ -58,6 +60,8 @@ test("removes disposable starter assets and metadata", async () => {
   assert.match(page, /preparePublish/);
   assert.match(page, /contentEditable/);
   assert.match(page, /resolveEditorShortcut/);
+  assert.match(page, /collectBlogCategories/);
+  assert.match(page, /appendTrailingEditorLine/);
   assert.doesNotMatch(page, /splitMarkdownBlocks/);
   assert.doesNotMatch(page, /const publishedArticle = \{[\s\S]{0,120}draft: false/);
   assert.match(layout, /lang="zh-CN"/);
