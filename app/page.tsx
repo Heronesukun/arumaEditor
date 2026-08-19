@@ -49,13 +49,17 @@ import { gfm } from "turndown-plugin-gfm";
 import {
   appendDraftRevision,
   buildLineDiff,
+  collectBlogCategories,
   collectBlogTags,
   hashText,
   mergeArticleFrontmatter,
   parseMarkdownSource,
   serializeArticleSource,
 } from "../lib/article-document.mjs";
-import { resolveEditorShortcut } from "../lib/editor-commands.mjs";
+import {
+  appendTrailingEditorLine,
+  resolveEditorShortcut,
+} from "../lib/editor-commands.mjs";
 import {
   ChangeEvent,
   ClipboardEvent,
@@ -73,6 +77,7 @@ type BlogType = "aruma" | "mizuki" | "compatible";
 type RevisionReason = "自动备份" | "手动保存" | "发布前" | "恢复前";
 type DiffType = "equal" | "add" | "remove";
 type EditorCommand =
+  | "undo"
   | "paragraph"
   | "h1"
   | "h2"
@@ -94,6 +99,11 @@ type EditorCommand =
 type TagPickerState = {
   draftId: string;
   selected: string[];
+};
+
+type UndoState = {
+  snapshots: string[];
+  lastCapturedAt: number;
 };
 
 function escapeHtml(value: string) {
@@ -138,12 +148,19 @@ previewRenderer.image = ({ href, title, text }) => {
   return `<img src="${escapeHtml(safeHref)}" alt="${escapeHtml(text)}"${titleAttribute}>`;
 };
 
+function trailingLineCount(value: string) {
+  return Math.min(2, value.match(/\n+$/)?.[0].length ?? 0);
+}
+
 function renderMarkdown(value: string) {
-  return marked.parse(value, {
+  const html = marked.parse(value, {
     breaks: true,
     gfm: true,
     renderer: previewRenderer,
   }) as string;
+  return `${html}${'<p data-trailing-editor-line="true"><br></p>'.repeat(
+    trailingLineCount(value),
+  )}`;
 }
 
 const markdownConverter = new TurndownService({
@@ -155,14 +172,72 @@ const markdownConverter = new TurndownService({
 });
 markdownConverter.use(gfm);
 
+function countTrailingVisualLines(editor: HTMLElement) {
+  let count = 0;
+  let element = editor.lastElementChild;
+  while (
+    element &&
+    count < 2 &&
+    element.matches("p, div") &&
+    !element.textContent?.trim() &&
+    !element.querySelector("img, hr, table, pre, ul, ol, blockquote")
+  ) {
+    count += 1;
+    element = element.previousElementSibling;
+  }
+  return count;
+}
+
+function isVisualCaretAtEnd(editor: HTMLElement) {
+  const selection = window.getSelection();
+  if (
+    !selection?.rangeCount ||
+    !selection.isCollapsed ||
+    !selection.anchorNode ||
+    !editor.contains(selection.anchorNode)
+  ) {
+    return false;
+  }
+
+  if (selection.anchorNode === editor) {
+    return selection.anchorOffset >= editor.childNodes.length;
+  }
+
+  let topLevelNode: Node = selection.anchorNode;
+  while (topLevelNode.parentNode && topLevelNode.parentNode !== editor) {
+    topLevelNode = topLevelNode.parentNode;
+  }
+  if (topLevelNode !== editor.lastElementChild) return false;
+
+  const tail = document.createRange();
+  tail.selectNodeContents(editor);
+  tail.setStart(selection.anchorNode, selection.anchorOffset);
+  const fragment = tail.cloneContents();
+  return (
+    !(fragment.textContent ?? "").trim() &&
+    !fragment.querySelector("img, hr, table, pre, ul, ol, blockquote")
+  );
+}
+
+function placeCaretAtEnd(element: HTMLElement) {
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  range.collapse(false);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
 function visualHtmlToMarkdown(editor: HTMLElement) {
-  return markdownConverter
+  const trailingLines = countTrailingVisualLines(editor);
+  const markdown = markdownConverter
     .turndown(editor.innerHTML)
     .replace(/\u00a0/g, " ")
     .replace(/^(\s*[-+*]) {2,}/gm, "$1 ")
     .replace(/^(\s*\d+\.) {2,}/gm, "$1 ")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
+  return `${markdown}${"\n".repeat(trailingLines)}`;
 }
 
 type Draft = {
@@ -612,6 +687,10 @@ export default function Home() {
   const [tagInput, setTagInput] = useState("");
   const [tagSearch, setTagSearch] = useState("");
   const [tagPicker, setTagPicker] = useState<TagPickerState | null>(null);
+  const [categorySearch, setCategorySearch] = useState("");
+  const [categoryPickerDraftId, setCategoryPickerDraftId] = useState<
+    string | null
+  >(null);
   const [isDark, setIsDark] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(true);
@@ -635,6 +714,7 @@ export default function Home() {
   const visualEditorRef = useRef<HTMLElement>(null);
   const visualDraftIdRef = useRef<string | null>(null);
   const visualComposingRef = useRef(false);
+  const undoStateRef = useRef(new Map<string, UndoState>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const blogHandlesRef = useRef(new Map<string, DirectoryHandleLike>());
 
@@ -854,6 +934,16 @@ export default function Home() {
       query ? tag.name.toLocaleLowerCase().includes(query) : true,
     );
   }, [blogTags, tagSearch]);
+  const blogCategories = useMemo(
+    () => collectBlogCategories(drafts, tagBlogId),
+    [drafts, tagBlogId],
+  );
+  const filteredBlogCategories = useMemo(() => {
+    const query = categorySearch.trim().toLocaleLowerCase();
+    return blogCategories.filter((category: { name: string; count: number }) =>
+      query ? category.name.toLocaleLowerCase().includes(query) : true,
+    );
+  }, [blogCategories, categorySearch]);
 
   const updateActive = useCallback(
     (patch: Partial<Draft>) => {
@@ -868,6 +958,54 @@ export default function Home() {
     },
     [active],
   );
+
+  const updateActiveContent = useCallback(
+    (content: string, forceSnapshot = false) => {
+      if (!active || content === active.content) return;
+
+      const now = Date.now();
+      const undoState = undoStateRef.current.get(active.id) ?? {
+        snapshots: [],
+        lastCapturedAt: 0,
+      };
+      if (
+        forceSnapshot ||
+        !undoState.lastCapturedAt ||
+        now - undoState.lastCapturedAt >= 700
+      ) {
+        if (undoState.snapshots.at(-1) !== active.content) {
+          undoState.snapshots.push(active.content);
+          undoState.snapshots = undoState.snapshots.slice(-100);
+        }
+        undoState.lastCapturedAt = now;
+      }
+      undoStateRef.current.set(active.id, undoState);
+      updateActive({ content });
+    },
+    [active, updateActive],
+  );
+
+  const undoContent = useCallback(() => {
+    if (!active) return;
+    const undoState = undoStateRef.current.get(active.id);
+    const previous = undoState?.snapshots.pop();
+    if (previous === undefined) {
+      setToast("没有可撤回的正文修改");
+      return;
+    }
+
+    undoState.lastCapturedAt = 0;
+    updateActive({ content: previous });
+    const editor = visualEditorRef.current;
+    if (editor && viewMode !== "write") {
+      editor.innerHTML = renderMarkdown(previous);
+      window.requestAnimationFrame(() => {
+        editor.focus();
+        placeCaretAtEnd(editor);
+      });
+    }
+    setToast("已撤回上一次正文修改");
+  }, [active, updateActive, viewMode]);
 
   const showMessage = (message: string) => setToast(message);
 
@@ -930,7 +1068,7 @@ export default function Home() {
       selection +
       after +
       active.content.slice(end);
-    updateActive({ content: next });
+    updateActiveContent(next, true);
     window.requestAnimationFrame(() => {
       textarea.focus();
       textarea.setSelectionRange(
@@ -964,12 +1102,12 @@ export default function Home() {
         return line;
       })
       .join("\n");
-    updateActive({
-      content:
-        active.content.slice(0, lineStart) +
+    updateActiveContent(
+      active.content.slice(0, lineStart) +
         replacement +
         active.content.slice(lineEnd),
-    });
+      true,
+    );
     window.requestAnimationFrame(() => {
       textarea.focus();
       textarea.setSelectionRange(lineStart, lineStart + replacement.length);
@@ -997,14 +1135,16 @@ export default function Home() {
   };
 
   const syncVisualEditor = useCallback(
-    (canonicalize = false) => {
+    (canonicalize = false, forceSnapshot = false) => {
       const editor = visualEditorRef.current;
       if (!editor || !active || visualComposingRef.current) return;
       const markdown = visualHtmlToMarkdown(editor);
-      if (markdown !== active.content) updateActive({ content: markdown });
+      if (markdown !== active.content) {
+        updateActiveContent(markdown, forceSnapshot);
+      }
       if (canonicalize) editor.innerHTML = renderMarkdown(markdown);
     },
-    [active, updateActive],
+    [active, updateActiveContent],
   );
 
   const updateVisualCursorLine = () => {
@@ -1064,12 +1204,16 @@ export default function Home() {
     }
 
     window.requestAnimationFrame(() => {
-      syncVisualEditor();
+      syncVisualEditor(false, true);
       updateVisualCursorLine();
     });
   };
 
   const runEditorCommand = (command: EditorCommand) => {
+    if (command === "undo") {
+      undoContent();
+      return;
+    }
     const visualEditor = visualEditorRef.current;
     const shouldUseVisualEditor =
       visualEditor &&
@@ -1088,6 +1232,27 @@ export default function Home() {
 
   const handleEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (runShortcut(event)) return;
+    if (
+      event.key === "ArrowDown" &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      event.currentTarget.selectionStart === event.currentTarget.selectionEnd &&
+      event.currentTarget.selectionEnd === event.currentTarget.value.length
+    ) {
+      const next = appendTrailingEditorLine(event.currentTarget.value);
+      if (next !== null) {
+        event.preventDefault();
+        updateActiveContent(next, true);
+        window.requestAnimationFrame(() => {
+          const textarea = textareaRef.current;
+          textarea?.focus();
+          textarea?.setSelectionRange(next.length, next.length);
+        });
+        return;
+      }
+    }
     if (event.key === "Tab") {
       event.preventDefault();
       insertSourceMarkdown("  ", "", "");
@@ -1095,7 +1260,36 @@ export default function Home() {
   };
 
   const handleVisualEditorKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    runShortcut(event);
+    if (runShortcut(event)) return;
+    if (
+      event.key !== "ArrowDown" ||
+      event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.shiftKey
+    ) {
+      return;
+    }
+
+    const editor = visualEditorRef.current;
+    if (
+      !editor ||
+      !isVisualCaretAtEnd(editor) ||
+      countTrailingVisualLines(editor) >= 2
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    const line = document.createElement("p");
+    line.dataset.trailingEditorLine = "true";
+    line.append(document.createElement("br"));
+    editor.append(line);
+    placeCaretAtEnd(line);
+    window.requestAnimationFrame(() => {
+      syncVisualEditor(false, true);
+      updateVisualCursorLine();
+    });
   };
 
   const handleVisualPaste = (event: ClipboardEvent<HTMLElement>) => {
@@ -1121,9 +1315,28 @@ export default function Home() {
     setTagInput("");
   };
 
-  const openTagPicker = () => {
+  const toggleTagPicker = () => {
     setTagSearch("");
-    setTagPicker({ draftId: active.id, selected: [] });
+    setCategoryPickerDraftId(null);
+    setTagPicker((current) =>
+      current?.draftId === active.id
+        ? null
+        : { draftId: active.id, selected: [] },
+    );
+  };
+
+  const toggleCategoryPicker = () => {
+    setCategorySearch("");
+    setTagPicker(null);
+    setCategoryPickerDraftId((current) =>
+      current === active.id ? null : active.id,
+    );
+  };
+
+  const selectBlogCategory = (name: string) => {
+    updateActive({ category: name });
+    setCategoryPickerDraftId(null);
+    showMessage(`已选择分类「${name}」`);
   };
 
   const toggleSuggestedTag = (name: string) => {
@@ -2016,6 +2229,10 @@ export default function Home() {
                 className="format-actions"
                 onMouseDown={(event) => event.preventDefault()}
               >
+                <button onClick={() => runEditorCommand("undo")} title="撤回 · Ctrl / ⌘ + Z">
+                  <RotateCcw size={17} />
+                </button>
+                <span />
                 <button onClick={() => runEditorCommand("h2")} title="二级标题 · Ctrl / ⌘ + 2">
                   <Heading2 size={17} />
                 </button>
@@ -2054,6 +2271,7 @@ export default function Home() {
                   </summary>
                   <div className="shortcut-popover">
                     <strong>常用编辑快捷键</strong>
+                    <span><kbd>Ctrl / ⌘ + Z</kbd> 撤回正文修改</span>
                     <span><kbd>Ctrl / ⌘ + 1…6</kbd> 标题 1…6</span>
                     <span><kbd>Ctrl / ⌘ + 0</kbd> 正文段落</span>
                     <span><kbd>Ctrl / ⌘ + B</kbd> 加粗</span>
@@ -2105,7 +2323,7 @@ export default function Home() {
                   <textarea
                     ref={textareaRef}
                     value={active.content}
-                    onChange={(event) => updateActive({ content: event.target.value })}
+                    onChange={(event) => updateActiveContent(event.target.value)}
                     onKeyDown={handleEditorKeyDown}
                     onSelect={(event) =>
                       setCursorLine(
@@ -2123,7 +2341,7 @@ export default function Home() {
                 <div className="preview-pane">
                   <div className="pane-label">
                     <span>INSTANT EDITOR</span>
-                    <small>连续编辑 · 离开当前格式即可看到最终排版</small>
+                    <small>连续编辑 · 文末 ↓ 最多补两行</small>
                   </div>
                   <article
                     ref={visualEditorRef}
@@ -2249,14 +2467,72 @@ export default function Home() {
                       onChange={(event) => updateActive({ published: event.target.value })}
                     />
                   </label>
-                  <label>
-                    <span>分类</span>
-                    <input
-                      value={active.category}
-                      onChange={(event) => updateActive({ category: event.target.value })}
-                      placeholder="日常"
-                    />
-                  </label>
+                  <div className="category-field">
+                    <label>
+                      <span>分类</span>
+                      <input
+                        value={active.category}
+                        onChange={(event) => updateActive({ category: event.target.value })}
+                        placeholder="日常"
+                      />
+                    </label>
+                    {tagBlog && (
+                      <button
+                        className="category-picker-trigger"
+                        onClick={toggleCategoryPicker}
+                        aria-expanded={categoryPickerDraftId === active.id}
+                      >
+                        <FolderHeart size={12} />
+                        <span>从 {tagBlog.name} 选择</span>
+                        <ChevronDown
+                          className={categoryPickerDraftId === active.id ? "rotated" : ""}
+                          size={12}
+                        />
+                      </button>
+                    )}
+                    {categoryPickerDraftId === active.id && (
+                      <div className="category-picker-popover">
+                        <label className="tag-picker-search">
+                          <Search size={13} />
+                          <input
+                            value={categorySearch}
+                            onChange={(event) => setCategorySearch(event.target.value)}
+                            placeholder="搜索已有分类"
+                            autoFocus
+                          />
+                          {categorySearch && (
+                            <button
+                              onClick={() => setCategorySearch("")}
+                              aria-label="清空分类搜索"
+                            >
+                              <X size={12} />
+                            </button>
+                          )}
+                        </label>
+                        <div className="category-suggestions">
+                          {filteredBlogCategories.map(
+                            (category: { name: string; count: number }) => (
+                              <button
+                                key={category.name}
+                                className={active.category === category.name ? "active" : ""}
+                                onClick={() => selectBlogCategory(category.name)}
+                              >
+                                <span>{category.name}</span>
+                                <small>{category.count} 篇文章</small>
+                              </button>
+                            ),
+                          )}
+                          {!filteredBlogCategories.length && (
+                            <div className="tag-picker-empty">
+                              {blogCategories.length
+                                ? "没有匹配的分类"
+                                : "博客文章中还没有可复用的分类"}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <label>
@@ -2325,13 +2601,20 @@ export default function Home() {
                 />
               </label>
               {tagBlog && (
-                <button className="tag-picker-trigger" onClick={openTagPicker}>
+                <button
+                  className="tag-picker-trigger"
+                  onClick={toggleTagPicker}
+                  aria-expanded={tagPicker?.draftId === active.id}
+                >
                   <Tag size={14} />
                   <span>
                     <strong>从 {tagBlog.name} 选择</strong>
                     <small>{blogTags.length} 个已有标签</small>
                   </span>
-                  <ChevronDown size={14} />
+                  <ChevronDown
+                    className={tagPicker?.draftId === active.id ? "rotated" : ""}
+                    size={14}
+                  />
                 </button>
               )}
               {tagPicker?.draftId === active.id && (

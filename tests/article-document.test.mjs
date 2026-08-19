@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   appendDraftRevision,
   buildLineDiff,
+  collectBlogCategories,
   collectBlogTags,
   hashText,
   parseMarkdownSource,
@@ -130,4 +131,20 @@ test("collects reusable tags from the selected blog", () => {
     { name: "生活", count: 1 },
   ]);
   assert.deepEqual(collectBlogTags(drafts, null), []);
+});
+
+test("collects reusable categories from the selected blog", () => {
+  const drafts = [
+    { blogId: "blog-a", category: "技术" },
+    { blogId: "blog-a", category: " 技术 " },
+    { blogId: "blog-a", category: "日常" },
+    { blogId: "blog-a", category: "" },
+    { blogId: "blog-b", category: "不应出现" },
+  ];
+
+  assert.deepEqual(collectBlogCategories(drafts, "blog-a"), [
+    { name: "技术", count: 2 },
+    { name: "日常", count: 1 },
+  ]);
+  assert.deepEqual(collectBlogCategories(drafts, null), []);
 });

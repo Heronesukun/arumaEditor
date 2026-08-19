@@ -60,8 +60,9 @@ image: ./cover.webp
 - Markdown 源码、分栏和连续即时排版编辑模式
 - 类 Typora 的连续编辑体验，可使用方向键自由跨段落和上下行移动
 - 标题、加粗、斜体、链接、列表、引用、代码等常用键盘快捷键
+- 工具栏或 `Ctrl/Cmd + Z` 撤回正文修改，文末按向下方向键最多自动补出两行
 - 标题、日期、分类、作者、摘要、头图、标签等可视化 Frontmatter 表单
-- 从当前博客复用已有标签，支持搜索、使用次数和批量选择
+- 从当前博客复用已有分类和标签，支持搜索、使用次数及标签批量选择
 - 一次粘贴多个以逗号或换行分隔的标签
 - 本地草稿自动保存，重启后继续写作
 - 同时管理多个博客连接，每篇草稿独立绑定发布目标
@@ -147,9 +148,9 @@ build-resources/     桌面应用图标
 项目使用 `v*` Git 标签驱动 GitHub Actions。推送标签后，工作流会在 Windows 环境中安装依赖、运行测试与代码检查、生成便携版，并自动创建 GitHub Release。
 
 ```bash
-git tag -a v0.4.1 -m "Aruma Editor 0.4.1"
+git tag -a v0.5.0 -m "Aruma Editor 0.5.0"
 git push origin main
-git push origin v0.4.1
+git push origin v0.5.0
 ```
 
 ## 已知边界

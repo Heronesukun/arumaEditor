@@ -46,3 +46,28 @@ jobs:
           $version = node -p "require('./package.json').version"
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "v$version" }
           gh release create "$tag" "$($asset.FullName)" --target "$env:GITHUB_SHA" --generate-notes --title "Aruma Editor $tag"
+
+      - name: Clean exact temporary release branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          $branches = @(
+            "agent/tag-picker-visual-editing",
+            "agent/release-0.4.1",
+            "release/v0.4.1",
+            "agent/release-$version",
+            "release/v$version"
+          ) | Select-Object -Unique
+
+          foreach ($branch in $branches) {
+            gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/$branch" --silent 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/heads/$branch" --silent
+              if ($LASTEXITCODE -ne 0) { throw "Failed to delete temporary branch: $branch" }
+              Write-Host "Deleted temporary branch: $branch"
+            } else {
+              Write-Host "Temporary branch already absent: $branch"
+            }
+          }
