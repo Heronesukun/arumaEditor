@@ -58,7 +58,10 @@ image: ./cover.webp
 ## 核心功能
 
 - Markdown 写作、实时预览、分栏和纯预览模式
+- 所见即所得内容块编辑：点击预览中的段落即可修改对应 Markdown
 - 标题、日期、分类、作者、摘要、头图、标签等可视化 Frontmatter 表单
+- 从当前博客复用已有标签，支持搜索、使用次数和批量选择
+- 一次粘贴多个以逗号或换行分隔的标签
 - 本地草稿自动保存，重启后继续写作
 - 同时管理多个博客连接，每篇草稿独立绑定发布目标
 - 同步博客现有文章，并从编辑器继续修改
@@ -143,9 +146,9 @@ build-resources/     桌面应用图标
 项目使用 `v*` Git 标签驱动 GitHub Actions。推送标签后，工作流会在 Windows 环境中安装依赖、运行测试与代码检查、生成便携版，并自动创建 GitHub Release。
 
 ```bash
-git tag -a v0.3.0 -m "Aruma Editor 0.3.0"
+git tag -a v0.4.0 -m "Aruma Editor 0.4.0"
 git push origin main
-git push origin v0.3.0
+git push origin v0.4.0
 ```
 
 ## 已知边界
