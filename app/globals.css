@@ -137,6 +137,7 @@ textarea:focus-visible {
 .profile-card,
 .editor-subline,
 .editor-toolbar,
+.editor-toolbar-end,
 .format-actions,
 .view-switcher,
 .pane-label,
@@ -660,12 +661,13 @@ textarea:focus-visible {
   flex: 1;
   flex-direction: column;
   border-radius: 9px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .editor-heading {
   padding: 18px 24px 12px;
   background: color-mix(in srgb, var(--panel-strong) 70%, transparent);
+  border-radius: 8px 8px 0 0;
 }
 
 .title-input {
@@ -705,6 +707,12 @@ textarea:focus-visible {
 .format-actions,
 .view-switcher {
   gap: 2px;
+}
+
+.editor-toolbar-end {
+  position: relative;
+  flex-shrink: 0;
+  gap: 7px;
 }
 
 .format-actions button,
@@ -758,6 +766,70 @@ textarea:focus-visible {
   color: var(--pink);
   background: var(--panel-strong);
   box-shadow: 0 1px 4px rgba(36, 28, 36, 0.08);
+}
+
+.shortcut-help {
+  position: relative;
+}
+
+.shortcut-help summary {
+  height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 9px;
+  list-style: none;
+}
+
+.shortcut-help summary::-webkit-details-marker {
+  display: none;
+}
+
+.shortcut-help summary:hover,
+.shortcut-help[open] summary {
+  color: var(--pink);
+  background: var(--hover);
+}
+
+.shortcut-popover {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 250px;
+  display: grid;
+  gap: 7px;
+  padding: 13px;
+  color: var(--muted);
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  font-size: 9px;
+}
+
+.shortcut-popover strong {
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.shortcut-popover span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.shortcut-popover kbd {
+  color: var(--pink);
+  font-family: var(--mono);
+  font-size: 8px;
 }
 
 .writing-area {
@@ -848,76 +920,35 @@ textarea:focus-visible {
   margin-top: 0;
 }
 
-.rendered-markdown-block {
-  margin: -5px -9px;
-  padding: 5px 9px;
-  border: 1px solid transparent;
-  border-radius: 7px;
+.typora-editor {
+  caret-color: var(--pink);
   cursor: text;
   outline: none;
-  transition: 0.16s ease;
+  white-space: normal;
 }
 
-.rendered-markdown-block:hover,
-.rendered-markdown-block:focus-visible {
-  background: color-mix(in srgb, var(--hover) 66%, transparent);
-  border-color: rgba(255, 64, 129, 0.13);
+.typora-editor:focus {
+  background: color-mix(in srgb, var(--panel-strong) 52%, transparent);
 }
 
-.rendered-markdown-block > :first-child {
-  margin-top: 0;
-}
-
-.rendered-markdown-block > :last-child {
-  margin-bottom: 0;
-}
-
-.rendered-markdown-block a {
+.typora-editor:empty::before {
+  content: attr(data-placeholder);
+  color: var(--faint);
   pointer-events: none;
 }
 
-.visual-block-editor {
-  position: relative;
-  margin: 8px -10px;
-  padding: 9px 10px 27px;
-  background: color-mix(in srgb, var(--field) 82%, transparent);
-  border: 1px solid rgba(255, 64, 129, 0.32);
-  border-radius: 8px;
-  box-shadow: 0 0 0 3px rgba(255, 64, 129, 0.06);
-}
-
-.visual-block-editor textarea {
-  width: 100%;
-  min-height: 58px;
-  resize: vertical;
-  overflow: hidden;
+.typora-editor ::selection {
   color: var(--ink);
-  background: transparent;
-  border: 0;
-  outline: none;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.8;
-  tab-size: 2;
+  background: rgba(255, 64, 129, 0.18);
 }
 
-.visual-block-editor small {
-  position: absolute;
-  right: 10px;
-  bottom: 7px;
-  color: var(--faint);
-  font-family: var(--sans);
-  font-size: 8px;
-}
-
-.visual-editor-empty {
-  width: 100%;
-  min-height: 160px;
-  color: var(--faint);
-  text-align: left;
-  background: transparent;
-  border: 1px dashed var(--line);
-  border-radius: 8px;
+.typora-editor p,
+.typora-editor li,
+.typora-editor h1,
+.typora-editor h2,
+.typora-editor h3,
+.typora-editor h4,
+.typora-editor blockquote {
   cursor: text;
 }
 
@@ -1053,6 +1084,7 @@ textarea:focus-visible {
   font-size: 8px;
   background: var(--panel-strong);
   border-top: 1px solid var(--line);
+  border-radius: 0 0 8px 8px;
 }
 
 .editor-statusbar > span {
@@ -2420,6 +2452,18 @@ textarea:focus-visible {
 
   .format-actions {
     min-width: max-content;
+  }
+
+  .editor-toolbar-end {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .shortcut-popover {
+    position: fixed;
+    top: 108px;
+    right: 15px;
+    width: min(260px, calc(100vw - 30px));
   }
 
   .view-switcher {

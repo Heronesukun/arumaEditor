@@ -38,8 +38,9 @@ test("server-renders the Aruma and Mizuki writing workspace", async () => {
   assert.match(html, /管理博客连接/);
   assert.match(html, /版本历史/);
   assert.match(html, /Frontmatter/);
-  assert.match(html, /所见即所得/);
-  assert.match(html, /点击正文直接编辑/);
+  assert.match(html, /即时编辑/);
+  assert.match(html, /连续编辑/);
+  assert.match(html, /常用编辑快捷键/);
   assert.match(html, /可粘贴多个/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
@@ -55,6 +56,9 @@ test("removes disposable starter assets and metadata", async () => {
   assert.match(page, /showDirectoryPicker/);
   assert.match(page, /src\/content\/posts/);
   assert.match(page, /preparePublish/);
+  assert.match(page, /contentEditable/);
+  assert.match(page, /resolveEditorShortcut/);
+  assert.doesNotMatch(page, /splitMarkdownBlocks/);
   assert.doesNotMatch(page, /const publishedArticle = \{[\s\S]{0,120}draft: false/);
   assert.match(layout, /lang="zh-CN"/);
   assert.match(packageJson, /"name": "aruma-editor"/);
