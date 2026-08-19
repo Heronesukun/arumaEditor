@@ -20,6 +20,7 @@ import {
   History,
   Image as ImageIcon,
   Italic,
+  Keyboard as KeyboardIcon,
   Link2,
   List,
   Menu,
@@ -43,6 +44,8 @@ import {
   X,
 } from "lucide-react";
 import { marked } from "marked";
+import TurndownService from "turndown";
+import { gfm } from "turndown-plugin-gfm";
 import {
   appendDraftRevision,
   buildLineDiff,
@@ -52,8 +55,10 @@ import {
   parseMarkdownSource,
   serializeArticleSource,
 } from "../lib/article-document.mjs";
+import { resolveEditorShortcut } from "../lib/editor-commands.mjs";
 import {
   ChangeEvent,
+  ClipboardEvent,
   KeyboardEvent,
   useCallback,
   useEffect,
@@ -67,20 +72,24 @@ type ArticleSource = "draft" | "imported" | "published";
 type BlogType = "aruma" | "mizuki" | "compatible";
 type RevisionReason = "自动备份" | "手动保存" | "发布前" | "恢复前";
 type DiffType = "equal" | "add" | "remove";
-
-type MarkdownBlock = {
-  key: string;
-  start: number;
-  end: number;
-  source: string;
-  html: string;
-};
-
-type VisualBlockEdit = {
-  draftId: string;
-  start: number;
-  value: string;
-};
+type EditorCommand =
+  | "paragraph"
+  | "h1"
+  | "h2"
+  | "h3"
+  | "h4"
+  | "h5"
+  | "h6"
+  | "bold"
+  | "italic"
+  | "strike"
+  | "link"
+  | "image"
+  | "quote"
+  | "bullet-list"
+  | "ordered-list"
+  | "code"
+  | "horizontal-rule";
 
 type TagPickerState = {
   draftId: string;
@@ -137,32 +146,23 @@ function renderMarkdown(value: string) {
   }) as string;
 }
 
-function splitMarkdownBlocks(value: string, offset = 0): MarkdownBlock[] {
-  let cursor = 0;
-  return marked
-    .lexer(value, { breaks: true, gfm: true })
-    .flatMap((token, index) => {
-      const raw = String(token.raw ?? "");
-      if (!raw) return [];
-      const tokenStart = value.indexOf(raw, cursor);
-      if (tokenStart < 0) return [];
-      cursor = tokenStart + raw.length;
-      if (token.type === "space" || !raw.trim()) return [];
+const markdownConverter = new TurndownService({
+  bulletListMarker: "-",
+  codeBlockStyle: "fenced",
+  emDelimiter: "*",
+  headingStyle: "atx",
+  strongDelimiter: "**",
+});
+markdownConverter.use(gfm);
 
-      const trailingLines = raw.match(/(?:\r?\n)+$/)?.[0].length ?? 0;
-      const source = raw.slice(0, raw.length - trailingLines);
-      if (!source.trim()) return [];
-      const start = offset + tokenStart;
-      return [
-        {
-          key: `${start}-${token.type}-${index}`,
-          start,
-          end: start + source.length,
-          source,
-          html: renderMarkdown(source),
-        },
-      ];
-    });
+function visualHtmlToMarkdown(editor: HTMLElement) {
+  return markdownConverter
+    .turndown(editor.innerHTML)
+    .replace(/\u00a0/g, " ")
+    .replace(/^(\s*[-+*]) {2,}/gm, "$1 ")
+    .replace(/^(\s*\d+\.) {2,}/gm, "$1 ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
 }
 
 type Draft = {
@@ -612,7 +612,6 @@ export default function Home() {
   const [tagInput, setTagInput] = useState("");
   const [tagSearch, setTagSearch] = useState("");
   const [tagPicker, setTagPicker] = useState<TagPickerState | null>(null);
-  const [visualBlock, setVisualBlock] = useState<VisualBlockEdit | null>(null);
   const [isDark, setIsDark] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(true);
@@ -633,7 +632,9 @@ export default function Home() {
   );
   const [isInspecting, setIsInspecting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const visualTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const visualEditorRef = useRef<HTMLElement>(null);
+  const visualDraftIdRef = useRef<string | null>(null);
+  const visualComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const blogHandlesRef = useRef(new Map<string, DirectoryHandleLike>());
 
@@ -853,12 +854,6 @@ export default function Home() {
       query ? tag.name.toLocaleLowerCase().includes(query) : true,
     );
   }, [blogTags, tagSearch]);
-  const activeVisualBlock =
-    visualBlock?.draftId === active?.id ? visualBlock : null;
-  const previewBlocks = useMemo(
-    () => splitMarkdownBlocks(active?.content ?? ""),
-    [active?.content],
-  );
 
   const updateActive = useCallback(
     (patch: Partial<Draft>) => {
@@ -906,45 +901,24 @@ export default function Home() {
     });
   };
 
-  const insertMarkdown = (
+  useEffect(() => {
+    const editor = visualEditorRef.current;
+    if (!editor || !active) return;
+
+    const draftChanged = visualDraftIdRef.current !== active.id;
+    if (draftChanged || document.activeElement !== editor) {
+      const html = renderMarkdown(active.content);
+      if (editor.innerHTML !== html) editor.innerHTML = html;
+    }
+    visualDraftIdRef.current = active.id;
+  }, [active, viewMode]);
+
+  const insertSourceMarkdown = (
     before: string,
     after = "",
     placeholder = "在这里输入文字",
   ) => {
     if (!active) return;
-    const visualTextarea = visualTextareaRef.current;
-    if (
-      activeVisualBlock &&
-      visualTextarea &&
-      document.activeElement === visualTextarea
-    ) {
-      const start = visualTextarea.selectionStart;
-      const end = visualTextarea.selectionEnd;
-      const selection = activeVisualBlock.value.slice(start, end) || placeholder;
-      const nextBlock =
-        activeVisualBlock.value.slice(0, start) +
-        before +
-        selection +
-        after +
-        activeVisualBlock.value.slice(end);
-      const blockEnd = activeVisualBlock.start + activeVisualBlock.value.length;
-      updateActive({
-        content:
-          active.content.slice(0, activeVisualBlock.start) +
-          nextBlock +
-          active.content.slice(blockEnd),
-      });
-      setVisualBlock({ ...activeVisualBlock, value: nextBlock });
-      window.requestAnimationFrame(() => {
-        visualTextarea.focus();
-        visualTextarea.setSelectionRange(
-          start + before.length,
-          start + before.length + selection.length,
-        );
-      });
-      return;
-    }
-
     const textarea = textareaRef.current;
     if (!textarea) return;
     const start = textarea.selectionStart;
@@ -966,11 +940,175 @@ export default function Home() {
     });
   };
 
+  const applySourceBlockStyle = (command: EditorCommand) => {
+    const textarea = textareaRef.current;
+    if (!textarea || !active) return;
+
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const lineStart = active.content.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+    const nextBreak = active.content.indexOf("\n", end);
+    const lineEnd = nextBreak < 0 ? active.content.length : nextBreak;
+    const selectedLines = active.content.slice(lineStart, lineEnd).split("\n");
+    const stripped = selectedLines.map((line) =>
+      line.replace(/^(\s*)(?:#{1,6}\s+|>\s+|[-*+]\s+|\d+\.\s+)/, "$1"),
+    );
+    const replacement = stripped
+      .map((line, index) => {
+        if (/^h[1-6]$/.test(command)) {
+          return `${"#".repeat(Number(command.slice(1)))} ${line}`;
+        }
+        if (command === "quote") return `> ${line}`;
+        if (command === "bullet-list") return `- ${line}`;
+        if (command === "ordered-list") return `${index + 1}. ${line}`;
+        return line;
+      })
+      .join("\n");
+    updateActive({
+      content:
+        active.content.slice(0, lineStart) +
+        replacement +
+        active.content.slice(lineEnd),
+    });
+    window.requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(lineStart, lineStart + replacement.length);
+    });
+  };
+
+  const runSourceCommand = (command: EditorCommand) => {
+    if (/^h[1-6]$/.test(command) || command === "paragraph") {
+      applySourceBlockStyle(command);
+      return;
+    }
+    if (command === "quote" || command.endsWith("-list")) {
+      applySourceBlockStyle(command);
+      return;
+    }
+    if (command === "bold") insertSourceMarkdown("**", "**", "粗体文字");
+    if (command === "italic") insertSourceMarkdown("*", "*", "斜体文字");
+    if (command === "strike") insertSourceMarkdown("~~", "~~", "删除线文字");
+    if (command === "code") insertSourceMarkdown("`", "`", "code");
+    if (command === "link") insertSourceMarkdown("[", "](https://)", "链接文字");
+    if (command === "image") {
+      insertSourceMarkdown("![", "](./image.webp)", "图片说明");
+    }
+    if (command === "horizontal-rule") insertSourceMarkdown("\n---\n", "", "");
+  };
+
+  const syncVisualEditor = useCallback(
+    (canonicalize = false) => {
+      const editor = visualEditorRef.current;
+      if (!editor || !active || visualComposingRef.current) return;
+      const markdown = visualHtmlToMarkdown(editor);
+      if (markdown !== active.content) updateActive({ content: markdown });
+      if (canonicalize) editor.innerHTML = renderMarkdown(markdown);
+    },
+    [active, updateActive],
+  );
+
+  const updateVisualCursorLine = () => {
+    const editor = visualEditorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount || !selection.anchorNode) return;
+    if (!editor.contains(selection.anchorNode)) return;
+    const range = selection.getRangeAt(0).cloneRange();
+    range.selectNodeContents(editor);
+    range.setEnd(selection.anchorNode, selection.anchorOffset);
+    setCursorLine(Math.max(1, range.toString().split("\n").length));
+  };
+
+  const runVisualCommand = (command: EditorCommand) => {
+    const editor = visualEditorRef.current;
+    if (!editor) return;
+    editor.focus();
+
+    if (/^h[1-6]$/.test(command)) {
+      document.execCommand("formatBlock", false, command);
+    } else if (command === "paragraph") {
+      document.execCommand("formatBlock", false, "p");
+    } else if (command === "bold") {
+      document.execCommand("bold");
+    } else if (command === "italic") {
+      document.execCommand("italic");
+    } else if (command === "strike") {
+      document.execCommand("strikeThrough");
+    } else if (command === "quote") {
+      document.execCommand("formatBlock", false, "blockquote");
+    } else if (command === "bullet-list") {
+      document.execCommand("insertUnorderedList");
+    } else if (command === "ordered-list") {
+      document.execCommand("insertOrderedList");
+    } else if (command === "horizontal-rule") {
+      document.execCommand("insertHorizontalRule");
+    } else if (command === "link") {
+      const selected = window.getSelection()?.toString() || "链接文字";
+      document.execCommand(
+        "insertHTML",
+        false,
+        `<a href="https://">${escapeHtml(selected)}</a>`,
+      );
+    } else if (command === "image") {
+      document.execCommand(
+        "insertHTML",
+        false,
+        '<img src="./image.webp" alt="图片说明">',
+      );
+    } else if (command === "code") {
+      const selected = window.getSelection()?.toString() || "code";
+      document.execCommand(
+        "insertHTML",
+        false,
+        `<code>${escapeHtml(selected)}</code>`,
+      );
+    }
+
+    window.requestAnimationFrame(() => {
+      syncVisualEditor();
+      updateVisualCursorLine();
+    });
+  };
+
+  const runEditorCommand = (command: EditorCommand) => {
+    const visualEditor = visualEditorRef.current;
+    const shouldUseVisualEditor =
+      visualEditor &&
+      (document.activeElement === visualEditor || viewMode === "preview");
+    if (shouldUseVisualEditor) runVisualCommand(command);
+    else runSourceCommand(command);
+  };
+
+  const runShortcut = (event: KeyboardEvent<HTMLElement>) => {
+    const command = resolveEditorShortcut(event) as EditorCommand | null;
+    if (!command) return false;
+    event.preventDefault();
+    runEditorCommand(command);
+    return true;
+  };
+
   const handleEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (runShortcut(event)) return;
     if (event.key === "Tab") {
       event.preventDefault();
-      insertMarkdown("  ", "", "");
+      insertSourceMarkdown("  ", "", "");
     }
+  };
+
+  const handleVisualEditorKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    runShortcut(event);
+  };
+
+  const handleVisualPaste = (event: ClipboardEvent<HTMLElement>) => {
+    const text = event.clipboardData.getData("text/plain");
+    if (!text) return;
+    event.preventDefault();
+    document.execCommand("insertHTML", false, renderMarkdown(text));
+    window.requestAnimationFrame(() => syncVisualEditor());
+  };
+
+  const handleVisualInput = () => {
+    syncVisualEditor();
+    updateVisualCursorLine();
   };
 
   const addTag = () => {
@@ -1020,46 +1158,6 @@ export default function Home() {
     updateActive({ tags: [...active.tags, ...selected] });
     setTagPicker(null);
     showMessage(`已添加 ${selected.length} 个标签`);
-  };
-
-  const startVisualEdit = (block: MarkdownBlock) => {
-    setVisualBlock({
-      draftId: active.id,
-      start: block.start,
-      value: block.source,
-    });
-    window.requestAnimationFrame(() => {
-      visualTextareaRef.current?.focus();
-    });
-  };
-
-  const updateVisualBlock = (value: string) => {
-    if (!activeVisualBlock) return;
-    const blockEnd = activeVisualBlock.start + activeVisualBlock.value.length;
-    updateActive({
-      content:
-        active.content.slice(0, activeVisualBlock.start) +
-        value +
-        active.content.slice(blockEnd),
-    });
-    setVisualBlock({ ...activeVisualBlock, value });
-  };
-
-  const handleVisualEditorKeyDown = (
-    event: KeyboardEvent<HTMLTextAreaElement>,
-  ) => {
-    if (event.key === "Tab") {
-      event.preventDefault();
-      insertMarkdown("  ", "", "");
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-      event.preventDefault();
-      setVisualBlock(null);
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setVisualBlock(null);
-    }
   };
 
   const importFile = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1918,61 +2016,82 @@ export default function Home() {
                 className="format-actions"
                 onMouseDown={(event) => event.preventDefault()}
               >
-                <button onClick={() => insertMarkdown("## ", "", "小标题")} title="二级标题">
+                <button onClick={() => runEditorCommand("h2")} title="二级标题 · Ctrl / ⌘ + 2">
                   <Heading2 size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("**", "**", "粗体文字")} title="粗体">
+                <button onClick={() => runEditorCommand("bold")} title="粗体 · Ctrl / ⌘ + B">
                   <Bold size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("*", "*", "斜体文字")} title="斜体">
+                <button onClick={() => runEditorCommand("italic")} title="斜体 · Ctrl / ⌘ + I">
                   <Italic size={17} />
                 </button>
                 <span />
-                <button onClick={() => insertMarkdown("[", "](https://)", "链接文字")} title="链接">
+                <button onClick={() => runEditorCommand("link")} title="链接 · Ctrl / ⌘ + K">
                   <Link2 size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("![", "](./image.webp)", "图片说明")} title="图片">
+                <button onClick={() => runEditorCommand("image")} title="图片">
                   <ImageIcon size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("> ", "", "引用内容")} title="引用">
+                <button onClick={() => runEditorCommand("quote")} title="引用 · Ctrl / ⌘ + Shift + Q">
                   <Quote size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("- ", "", "列表项")} title="无序列表">
+                <button onClick={() => runEditorCommand("bullet-list")} title="无序列表 · Ctrl / ⌘ + Shift + 8">
                   <List size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("`", "`", "code")} title="行内代码">
+                <button onClick={() => runEditorCommand("code")} title="行内代码 · Ctrl / ⌘ + `">
                   <Code2 size={17} />
                 </button>
-                <button onClick={() => insertMarkdown("\n---\n", "", "")} title="分割线">
+                <button onClick={() => runEditorCommand("horizontal-rule")} title="分割线">
                   <MoreHorizontal size={17} />
                 </button>
               </div>
 
-              <div className="view-switcher" aria-label="编辑视图">
-                <button
-                  className={viewMode === "write" ? "active" : ""}
-                  onClick={() => setViewMode("write")}
-                  title="仅编辑"
-                >
-                  <PenLine size={15} />
-                  <span>编辑</span>
-                </button>
-                <button
-                  className={viewMode === "split" ? "active" : ""}
-                  onClick={() => setViewMode("split")}
-                  title="分栏"
-                >
-                  <Columns2 size={15} />
-                  <span>分栏</span>
-                </button>
-                <button
-                  className={viewMode === "preview" ? "active" : ""}
-                  onClick={() => setViewMode("preview")}
-                  title="所见即所得编辑"
-                >
-                  <Eye size={15} />
-                  <span>所见即所得</span>
-                </button>
+              <div className="editor-toolbar-end">
+                <details className="shortcut-help">
+                  <summary title="查看快捷键">
+                    <KeyboardIcon size={15} />
+                    <span>快捷键</span>
+                  </summary>
+                  <div className="shortcut-popover">
+                    <strong>常用编辑快捷键</strong>
+                    <span><kbd>Ctrl / ⌘ + 1…6</kbd> 标题 1…6</span>
+                    <span><kbd>Ctrl / ⌘ + 0</kbd> 正文段落</span>
+                    <span><kbd>Ctrl / ⌘ + B</kbd> 加粗</span>
+                    <span><kbd>Ctrl / ⌘ + I</kbd> 斜体</span>
+                    <span><kbd>Ctrl / ⌘ + K</kbd> 链接</span>
+                    <span><kbd>Ctrl / ⌘ + `</kbd> 行内代码</span>
+                    <span><kbd>Ctrl / ⌘ + Shift + 7 / 8</kbd> 有序 / 无序列表</span>
+                    <span><kbd>Ctrl / ⌘ + Shift + Q</kbd> 引用</span>
+                    <span><kbd>Ctrl / ⌘ + Shift + X</kbd> 删除线</span>
+                  </div>
+                </details>
+
+                <div className="view-switcher" aria-label="编辑视图">
+                  <button
+                    className={viewMode === "write" ? "active" : ""}
+                    onClick={() => setViewMode("write")}
+                    title="Markdown 源码"
+                  >
+                    <PenLine size={15} />
+                    <span>源码</span>
+                  </button>
+                  <button
+                    className={viewMode === "split" ? "active" : ""}
+                    onClick={() => setViewMode("split")}
+                    title="分栏"
+                  >
+                    <Columns2 size={15} />
+                    <span>分栏</span>
+                  </button>
+                  <button
+                    className={viewMode === "preview" ? "active" : ""}
+                    onClick={() => setViewMode("preview")}
+                    title="即时排版编辑"
+                  >
+                    <Eye size={15} />
+                    <span>即时编辑</span>
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -2003,116 +2122,33 @@ export default function Home() {
               {viewMode !== "write" && (
                 <div className="preview-pane">
                   <div className="pane-label">
-                    <span>VISUAL EDITOR</span>
-                    <small>点击正文直接编辑 · Ctrl / ⌘ + Enter 完成</small>
+                    <span>INSTANT EDITOR</span>
+                    <small>连续编辑 · 离开当前格式即可看到最终排版</small>
                   </div>
-                  <article className="markdown-body visual-markdown-editor">
-                    {activeVisualBlock ? (
-                      <>
-                        {splitMarkdownBlocks(
-                          active.content.slice(0, activeVisualBlock.start),
-                        ).map((block) => (
-                          <div
-                            key={block.key}
-                            className="rendered-markdown-block"
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => startVisualEdit(block)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                startVisualEdit(block);
-                              }
-                            }}
-                            dangerouslySetInnerHTML={{ __html: block.html }}
-                          />
-                        ))}
-                        <div className="visual-block-editor">
-                          <textarea
-                            ref={visualTextareaRef}
-                            value={activeVisualBlock.value}
-                            onChange={(event) =>
-                              updateVisualBlock(event.target.value)
-                            }
-                            onKeyDown={handleVisualEditorKeyDown}
-                            onSelect={(event) =>
-                              setCursorLine(
-                                active.content
-                                  .slice(
-                                    0,
-                                    activeVisualBlock.start +
-                                      event.currentTarget.selectionStart,
-                                  )
-                                  .split("\n").length,
-                              )
-                            }
-                            onBlur={() => setVisualBlock(null)}
-                            rows={Math.max(
-                              2,
-                              activeVisualBlock.value.split("\n").length,
-                            )}
-                            spellCheck={false}
-                            aria-label="正在编辑的 Markdown 内容块"
-                          />
-                          <small>Markdown 语法 · Esc 或 Ctrl / ⌘ + Enter 完成</small>
-                        </div>
-                        {splitMarkdownBlocks(
-                          active.content.slice(
-                            activeVisualBlock.start +
-                              activeVisualBlock.value.length,
-                          ),
-                          activeVisualBlock.start + activeVisualBlock.value.length,
-                        ).map((block) => (
-                          <div
-                            key={block.key}
-                            className="rendered-markdown-block"
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => startVisualEdit(block)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                startVisualEdit(block);
-                              }
-                            }}
-                            dangerouslySetInnerHTML={{ __html: block.html }}
-                          />
-                        ))}
-                      </>
-                    ) : previewBlocks.length ? (
-                      previewBlocks.map((block) => (
-                        <div
-                          key={block.key}
-                          className="rendered-markdown-block"
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => startVisualEdit(block)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              startVisualEdit(block);
-                            }
-                          }}
-                          dangerouslySetInnerHTML={{ __html: block.html }}
-                        />
-                      ))
-                    ) : (
-                      <button
-                        className="visual-editor-empty"
-                        onClick={() =>
-                          startVisualEdit({
-                            key: "empty",
-                            start: 0,
-                            end: 0,
-                            source: "",
-                            html: "",
-                          })
-                        }
-                      >
-                        点击这里开始写作…
-                      </button>
-                    )}
-                  </article>
+                  <article
+                    ref={visualEditorRef}
+                    className="markdown-body typora-editor"
+                    contentEditable
+                    suppressContentEditableWarning
+                    role="textbox"
+                    aria-label="即时排版 Markdown 编辑器"
+                    aria-multiline="true"
+                    data-placeholder="从这里开始写作…"
+                    onInput={handleVisualInput}
+                    onKeyDown={handleVisualEditorKeyDown}
+                    onKeyUp={updateVisualCursorLine}
+                    onClick={updateVisualCursorLine}
+                    onPaste={handleVisualPaste}
+                    onCompositionStart={() => {
+                      visualComposingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      visualComposingRef.current = false;
+                      syncVisualEditor();
+                    }}
+                    onBlur={() => syncVisualEditor(true)}
+                    spellCheck
+                  />
                 </div>
               )}
             </div>
